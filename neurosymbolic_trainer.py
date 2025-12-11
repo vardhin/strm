@@ -8,7 +8,7 @@ import numpy as np
 class NeurosymbolicTrainer:
     """
     Trains TRM with FULL VISIBILITY into reasoning process
-    Uses beam search + demonstrations for faster convergence
+    Uses random exploration + reinforcement learning
     """
     def __init__(self, primitives_manager, learning_rate=1e-3, device='cpu', verbose=True):
         from neurosymbolic_trm import NeurosymbolicTRM
@@ -22,14 +22,11 @@ class NeurosymbolicTrainer:
         
         self.verbose = verbose
         
-        # Pre-defined programs for curriculum learning
+        # Demo programs ONLY for verification, not for cheating
         self.demo_programs = {
             "identity": ["LOAD_0"],
             "increment": ["LOAD_0", "CONST_1", "ADD"],
-            "decrement": ["LOAD_0", "CONST_1", "SUB"],
             "addition": ["LOAD_0", "LOAD_1", "ADD"],
-            "subtraction": ["LOAD_0", "LOAD_1", "SUB"],
-            "double": ["LOAD_0", "CONST_2", "MUL"],
         }
         
         # Get pad token ID
@@ -41,10 +38,11 @@ class NeurosymbolicTrainer:
             self.pad_id = self.prims.token_to_id.get("DONE", 0)
 
     def train_phase(self, task_name: str, train_data: np.ndarray, 
-                   n_inputs: int, n_outputs: int, num_epochs: int = 30,
-                   detailed_example_idx=0, use_demo=True):
+                   n_inputs: int, n_outputs: int, num_epochs: int = 50,
+                   detailed_example_idx=0, use_demo=False):
         """
-        Train with BEAM SEARCH + supervised learning from demonstrations
+        Train with pure exploration + reinforcement learning
+        NO CHEATING WITH TEMPLATES!
         """
         
         print(f"\n{'='*60}")
@@ -64,384 +62,193 @@ class NeurosymbolicTrainer:
             device=self.device
         )
         
-        # Get demonstration program if available
-        demo_program = None
-        if use_demo and task_name in self.demo_programs:
-            demo_program = self.demo_programs[task_name]
-            print(f"💡 Using demonstration: {' '.join(demo_program)}\n")
-        
-        all_programs = []
+        # Track best program found through exploration
         best_program = None
         best_success_rate = 0.0
+        programs_tried = set()
         
         for epoch in range(num_epochs):
-            self.optimizer.zero_grad()
-            
-            # Phase 1: Supervised learning from demonstration (if available)
-            if demo_program and epoch < 10:
-                # Learn to imitate the demonstration
-                demo_ids = [self.prims.token_to_id[t] for t in demo_program]
-                
-                # Forward pass
+            # PHASE 1: Exploration - sample programs from model
+            self.model.eval()
+            with torch.no_grad():
                 program_logits, z_scratchpad, satisfaction, q_halt = self.model(problem_data)
                 
-                # Supervised loss: cross-entropy to match demo
-                loss = 0
-                for pos, target_id in enumerate(demo_ids):
-                    if pos >= program_logits.size(1):
-                        break
-                    logits = program_logits[0, pos]
-                    loss = loss + F.cross_entropy(
-                        logits.unsqueeze(0), 
-                        torch.tensor([target_id], device=self.device)
-                    )
-                
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                
-                # Evaluate demo program
-                n_correct = 0
-                for i in range(len(inputs)):
-                    input_tuple = tuple(inputs[i].astype(int))
-                    target_tuple = tuple(targets[i].astype(int))
-                    result = self.executor.execute_program(demo_program, input_tuple, trace=False)
-                    if result is not None and result == target_tuple:
-                        n_correct += 1
-                
+                # Sample multiple programs using different temperatures
+                sampled_programs = []
+                for temp in [0.5, 1.0, 2.0]:
+                    for _ in range(10):  # Sample 10 programs per temperature
+                        program_tokens = self._sample_program(
+                            program_logits[0], 
+                            temperature=temp,
+                            n_inputs=n_inputs
+                        )
+                        
+                        # Deduplicate
+                        prog_key = tuple(program_tokens)
+                        if prog_key not in programs_tried:
+                            programs_tried.add(prog_key)
+                            sampled_programs.append(program_tokens)
+            
+            # PHASE 2: Evaluate all sampled programs
+            program_rewards = []
+            for program in sampled_programs:
+                n_correct = self._eval_program(program, inputs, targets)
                 success_rate = n_correct / len(inputs)
-                best_success_rate = max(best_success_rate, success_rate)
-                best_program = demo_program
+                program_rewards.append((program, success_rate))
                 
-                print(f"Epoch {epoch}: Loss={loss.item():.4f}, Success={success_rate*100:.1f}% [Learning from demo]")
-                
-            else:
-                # Phase 2: Beam search for program discovery
-                beam_size = 5
-                candidates = self._beam_search(problem_data, inputs, targets, beam_size=beam_size)
-                
-                # If beam search finds nothing good, try random search
-                if not candidates or candidates[0][1] < 0.5:  # Changed from 0.3
-                    if epoch % 3 == 0:  # Changed from every 5 to every 3 epochs
-                        print(f"Epoch {epoch}: Beam search stuck, trying random exploration...")
-                        random_candidates = self._random_search(inputs, targets, n_samples=100)  # Increased from 50
-                        if random_candidates and random_candidates[0][1] > candidates[0][1] if candidates else 0:
-                            print(f"   ✨ Random search found better program!")
-                            candidates = random_candidates
-                
-                if not candidates:
-                    print(f"Epoch {epoch}: No valid programs found")
-                    continue
-                
-                # Take best candidate
-                best_candidate = candidates[0]
-                program_tokens, success_rate, avg_reward = best_candidate
-                
-                # Update best program
+                # Track best
                 if success_rate > best_success_rate:
                     best_success_rate = success_rate
-                    best_program = program_tokens.copy()
+                    best_program = program
+            
+            # PHASE 3: Reinforcement learning - learn from good programs
+            if program_rewards:
+                # Sort by reward
+                program_rewards.sort(key=lambda x: x[1], reverse=True)
                 
-                # Learn from the best program found
-                if success_rate > 0.5:  # Only learn from decent programs
-                    program_ids = [self.prims.token_to_id[t] for t in program_tokens 
-                                  if t in self.prims.token_to_id]
+                # Take top programs that have non-zero reward
+                top_programs = [p for p, r in program_rewards[:5] if r > 0]
+                
+                if top_programs:
+                    self.model.train()
+                    total_loss = 0
                     
-                    # Forward pass
-                    program_logits, z_scratchpad, satisfaction, q_halt = self.model(problem_data)
+                    for program in top_programs:
+                        # Get reward
+                        reward = self._eval_program(program, inputs, targets) / len(inputs)
+                        
+                        if reward == 0:
+                            continue
+                        
+                        # Convert program to IDs
+                        program_ids = [self.prims.token_to_id[t] for t in program 
+                                      if t in self.prims.token_to_id]
+                        
+                        if len(program_ids) == 0:
+                            continue
+                        
+                        self.optimizer.zero_grad()
+                        
+                        # Forward pass
+                        program_logits, z_scratchpad, satisfaction, q_halt = self.model(problem_data)
+                        
+                        # Policy gradient loss (REINFORCE)
+                        loss = 0
+                        for pos, target_id in enumerate(program_ids[:min(len(program_ids), program_logits.size(1))]):
+                            logits = program_logits[0, pos]
+                            log_prob = F.log_softmax(logits, dim=-1)[target_id]
+                            
+                            # Weighted by reward
+                            loss = loss - log_prob * reward
+                        
+                        # Add entropy bonus for exploration
+                        probs = F.softmax(program_logits[0], dim=-1)
+                        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
+                        loss = loss - 0.01 * entropy  # Encourage exploration
+                        
+                        if not torch.isnan(loss) and not torch.isinf(loss):
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            self.optimizer.step()
+                            total_loss += loss.item()
                     
-                    # Supervised loss to match the good program
-                    loss = 0
-                    for pos, target_id in enumerate(program_ids):
-                        if pos >= program_logits.size(1):
-                            break
-                        logits = program_logits[0, pos]
-                        loss = loss + F.cross_entropy(
-                            logits.unsqueeze(0),
-                            torch.tensor([target_id], device=self.device)
-                        )
-                    
-                    if not torch.isnan(loss) and not torch.isinf(loss):
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        self.optimizer.step()
-                    
-                    program_str = ' '.join(program_tokens[:5])
-                    print(f"Epoch {epoch}: Loss={loss.item():.4f}, Success={success_rate*100:.1f}%, Program={program_str}")
+                    avg_loss = total_loss / max(len(top_programs), 1)
                 else:
-                    program_str = ' '.join(program_tokens[:5])
-                    print(f"Epoch {epoch}: Success={success_rate*100:.1f}%, Program={program_str}")
+                    avg_loss = 0.0
+            else:
+                avg_loss = 0.0
             
-            # Store program
-            if best_program:
-                all_programs.append(best_program[:10])
+            # Print progress
+            if epoch % 5 == 0 or best_success_rate >= 0.95:
+                print(f"Epoch {epoch}: Best={best_success_rate*100:.0f}%, Loss={avg_loss:.4f}")
+                if best_program:
+                    print(f"  Program: {' '.join(best_program[:10])}")
             
-            # Check if solved
-            if best_success_rate >= 0.95:
+            # Early stopping
+            if best_success_rate >= 1.0:
                 print(f"\n✅ Task solved at epoch {epoch}!\n")
-                break
+                return True, ' '.join(best_program)
         
-        # Extract result
+        # Final result
         if best_program and best_success_rate >= 0.95:
-            equation = ' '.join(best_program[:15])
+            return True, ' '.join(best_program)
         else:
-            equation = self._extract_equation(all_programs, task_name, n_inputs, n_outputs)
-        
-        success = best_success_rate >= 0.95
-        
-        return success, equation
+            return False, ' '.join(best_program) if best_program else "No solution found"
     
-    def _beam_search(self, problem_data, inputs, targets, beam_size=5, max_len=10):
+    def _sample_program(self, logits, temperature=1.0, max_len=10, n_inputs=1):
         """
-        Beam search with DIVERSITY BONUS to find good programs
-        Returns list of (program_tokens, success_rate, avg_reward) tuples
+        Sample a program from the model's distribution
+        Enforce validity constraints
         """
-        # Get logits from model
-        with torch.no_grad():
-            program_logits, _, _, _ = self.model(problem_data)
+        program = []
+        stack_depth = 0
         
-        # Initialize beam with empty programs
-        beam = [([],  0.0)]  # (program, log_prob)
-        
-        # Track token usage to encourage diversity
-        token_usage = Counter()
-        
-        for pos in range(min(max_len, program_logits.size(1))):
-            candidates = []
+        for pos in range(min(max_len, logits.size(0))):
+            # Get logits for this position
+            pos_logits = logits[pos] / temperature
             
-            for program, log_prob in beam:
-                logits = program_logits[0, pos]
-                probs = F.softmax(logits, dim=0)
-                
-                # Add diversity bonus: penalize frequently used tokens
-                diversity_bonus = torch.zeros_like(probs)
-                for token_name, count in token_usage.items():
-                    if token_name in self.prims.token_to_id:
-                        token_id = self.prims.token_to_id[token_name]
-                        # Reduce probability of overused tokens
-                        diversity_bonus[token_id] = -0.1 * count
-                
-                # Adjust probabilities with diversity bonus
-                adjusted_logits = logits + diversity_bonus
-                adjusted_probs = F.softmax(adjusted_logits, dim=0)
-                
-                # Get top-k tokens with temperature sampling for exploration
-                temperature = 1.5  # Higher = more exploration
-                temp_probs = F.softmax(adjusted_logits / temperature, dim=0)
-                
-                # Sample more tokens for diversity
-                top_k = min(beam_size * 2, temp_probs.size(0))
-                top_probs, top_indices = torch.topk(temp_probs, top_k)
-                
-                for prob, idx in zip(top_probs, top_indices):
-                    token_id = idx.item()
-                    token_name = self.prims.id_to_token[token_id]
-                    
-                    # Skip control tokens early in program
-                    if token_name in ['START', 'DONE', 'PAD'] and pos < 1:
-                        continue
-                    
-                    # Encourage using operations (not just LOAD)
-                    operation_bonus = 0.0
-                    if token_name in ['ADD', 'SUB', 'MUL', 'DIV', 'NEG', 'SQUARE']:
-                        operation_bonus = 0.3  # Boost operations
-                    elif token_name.startswith('CONST_'):
-                        operation_bonus = 0.2  # Also boost constants
-                    
-                    new_program = program + [token_name]
-                    new_log_prob = log_prob + torch.log(prob + 1e-10).item() + operation_bonus
-                    
-                    candidates.append((new_program, new_log_prob))
-                    token_usage[token_name] += 1
-                    
-                    # Stop this branch if we hit a terminator
-                    if token_name in ['DONE', 'PAD']:
-                        break
+            # Mask invalid tokens based on stack depth
+            mask = torch.zeros_like(pos_logits)
+            mask[:] = -float('inf')
             
-            # Keep top beam_size candidates
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            beam = candidates[:beam_size]
-        
-        # Evaluate all beam programs
-        results = []
-        for program, log_prob in beam:
-            n_correct = 0
-            rewards = []
+            # Always allow LOADs and CONSTs
+            for i in range(n_inputs):
+                load_id = self.prims.token_to_id.get(f'LOAD_{i}')
+                if load_id is not None:
+                    mask[load_id] = 0
             
-            for i in range(len(inputs)):
-                input_tuple = tuple(inputs[i].astype(int))
-                target_tuple = tuple(targets[i].astype(int))
-                
-                result = self.executor.execute_program(program, input_tuple, trace=False)
-                
-                if result is not None and result == target_tuple:
-                    n_correct += 1
-                    rewards.append(1.0)
-                else:
-                    rewards.append(0.0)
+            for i in range(10):
+                const_id = self.prims.token_to_id.get(f'CONST_{i}')
+                if const_id is not None:
+                    mask[const_id] = 0
             
-            success_rate = n_correct / len(inputs)
-            avg_reward = np.mean(rewards)
+            # Allow ops based on stack depth
+            if stack_depth >= 1:
+                for op in ['NEG', 'SQUARE']:
+                    op_id = self.prims.token_to_id.get(op)
+                    if op_id is not None:
+                        mask[op_id] = 0
             
-            results.append((program, success_rate, avg_reward))
-        
-        # Sort by success rate
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results
-    
-    def _random_search(self, inputs, targets, n_samples=50, max_len=8):
-        """
-        Smarter random search that respects stack constraints
-        """
-        results = []
-        
-        for _ in range(n_samples):
-            # Build program incrementally, tracking stack
-            program = []
-            stack_depth = 0
+            if stack_depth >= 2:
+                for op in ['ADD', 'SUB', 'MUL', 'DIV']:
+                    op_id = self.prims.token_to_id.get(op)
+                    if op_id is not None:
+                        mask[op_id] = 0
             
-            for pos in range(max_len):
-                # Choose token based on stack depth
-                if stack_depth == 0:
-                    # Need to push something onto stack
-                    candidates = [t for t in self.prims.get_primitive_names()
-                                if t.startswith('LOAD_') or t.startswith('CONST_')]
-                    token = np.random.choice(candidates)
-                    program.append(token)
-                    stack_depth += 1
-                    
-                elif stack_depth == 1:
-                    # Can push another value or apply unary op
-                    if np.random.random() < 0.6:  # 60% chance to push
-                        candidates = [t for t in self.prims.get_primitive_names()
-                                    if t.startswith('LOAD_') or t.startswith('CONST_')]
-                        token = np.random.choice(candidates)
-                        program.append(token)
-                        stack_depth += 1
-                    else:  # 40% chance unary op
-                        candidates = ['NEG', 'SQUARE']
-                        if candidates:
-                            token = np.random.choice(candidates)
-                            program.append(token)
-                            # stack_depth stays 1
-                
-                elif stack_depth >= 2:
-                    # Can apply binary op
-                    if np.random.random() < 0.7:  # 70% chance binary op
-                        candidates = ['ADD', 'SUB', 'MUL', 'DIV']
-                        token = np.random.choice(candidates)
-                        program.append(token)
-                        stack_depth -= 1  # Two inputs, one output
-                    else:  # 30% chance push another value
-                        if stack_depth < 4:  # Don't let stack get too deep
-                            candidates = [t for t in self.prims.get_primitive_names()
-                                        if t.startswith('LOAD_') or t.startswith('CONST_')]
-                            token = np.random.choice(candidates)
-                            program.append(token)
-                            stack_depth += 1
-                        else:
-                            # Force binary op
-                            candidates = ['ADD', 'SUB', 'MUL', 'DIV']
-                            token = np.random.choice(candidates)
-                            program.append(token)
-                            stack_depth -= 1
-                
-                # Stop if we have exactly one value on stack (valid output)
-                if stack_depth == 1 and len(program) >= 3 and np.random.random() < 0.3:
-                    break
+            # Sample token
+            masked_logits = pos_logits + mask
+            probs = F.softmax(masked_logits, dim=-1)
+            token_id = torch.multinomial(probs, 1).item()
+            token = self.prims.id_to_token[token_id]
             
-            # Only keep programs that end with stack depth 1
-            if stack_depth != 1:
+            # Skip control tokens
+            if token in ['PAD', 'START', 'DONE']:
                 continue
             
-            # Evaluate program
-            n_correct = 0
-            for i in range(len(inputs)):
-                input_tuple = tuple(inputs[i].astype(int))
-                target_tuple = tuple(targets[i].astype(int))
-                
-                result = self.executor.execute_program(program, input_tuple, trace=False)
-                
-                if result is not None and result == target_tuple:
-                    n_correct += 1
+            program.append(token)
             
-            success_rate = n_correct / len(inputs)
-            results.append((program, success_rate, 0.0))
+            # Update stack depth
+            if token.startswith('LOAD_') or token.startswith('CONST_'):
+                stack_depth += 1
+            elif token in ['NEG', 'SQUARE']:
+                pass  # Stack depth unchanged
+            elif token in ['ADD', 'SUB', 'MUL', 'DIV']:
+                stack_depth -= 1
+            
+            # Stop if valid program (stack_depth == 1)
+            if stack_depth == 1 and len(program) >= 2:
+                if np.random.random() < 0.3:  # 30% chance to stop
+                    break
         
-        # Remove duplicates
-        unique_results = {}
-        for prog, succ, _ in results:
-            prog_key = tuple(prog)
-            if prog_key not in unique_results or unique_results[prog_key][1] < succ:
-                unique_results[prog_key] = (prog, succ, 0.0)
-        
-        results = list(unique_results.values())
-        results.sort(key=lambda x: x[1], reverse=True)
-        
-        # Print top 3 for debugging
-        if results and results[0][1] > 0:
-            print(f"   🔍 Top random programs:")
-            for i, (prog, succ, _) in enumerate(results[:3]):
-                prog_str = ' '.join(prog[:8])
-                print(f"      {i+1}. [{succ*100:.0f}%] {prog_str}")
-        
-        return results
-    
-    def _guided_search(self, inputs, targets, n_samples=200, max_len=6):
-        """
-        Template-based search for common patterns
-        Focus on likely program structures
-        """
-        results = []
-        
-        # Template 1: LOAD_0 CONST_X OP (e.g., "a + 1", "a * 2")
-        for const in [0, 1, 2, 3, 4, 5]:
-            for op in ['ADD', 'SUB', 'MUL', 'DIV']:
-                program = ['LOAD_0', f'CONST_{const}', op]
-                n_correct = self._eval_program(program, inputs, targets)
-                if n_correct > 0:
-                    results.append((program, n_correct / len(inputs), 0.0))
-        
-        # Template 2: LOAD_0 CONST_X OP CONST_Y OP2 (e.g., "2*a + 1")
-        for c1 in [0, 1, 2, 3]:
-            for c2 in [0, 1, 2, 3]:
-                for op1 in ['ADD', 'MUL']:
-                    for op2 in ['ADD', 'SUB']:
-                        program = ['LOAD_0', f'CONST_{c1}', op1, f'CONST_{c2}', op2]
-                        n_correct = self._eval_program(program, inputs, targets)
-                        if n_correct > 0:
-                            results.append((program, n_correct / len(inputs), 0.0))
-        
-        # Template 3: LOAD_0 LOAD_0 OP (e.g., "a + a", "a * a")
-        for op in ['ADD', 'MUL']:
-            program = ['LOAD_0', 'LOAD_0', op]
-            n_correct = self._eval_program(program, inputs, targets)
-            if n_correct > 0:
-                results.append((program, n_correct / len(inputs), 0.0))
-        
-        # Template 4: LOAD_0 LOAD_0 OP CONST_X OP2 (e.g., "a*a + 1")
-        for c in [0, 1, 2]:
-            for op1 in ['ADD', 'MUL']:
-                for op2 in ['ADD', 'SUB']:
-                    program = ['LOAD_0', 'LOAD_0', op1, f'CONST_{c}', op2]
-                    n_correct = self._eval_program(program, inputs, targets)
-                    if n_correct > 0:
-                        results.append((program, n_correct / len(inputs), 0.0))
-        
-        results.sort(key=lambda x: x[1], reverse=True)
-        
-        # Print top programs
-        if results and results[0][1] >= 0.5:
-            print(f"   🎯 Guided search found promising programs:")
-            for i, (prog, succ, _) in enumerate(results[:3]):
-                if succ >= 0.5:
-                    prog_str = ' '.join(prog)
-                    print(f"      {i+1}. [{succ*100:.0f}%] {prog_str}")
-        
-        return results
+        return program
     
     def _eval_program(self, program, inputs, targets):
         """Helper to evaluate a program on all examples"""
+        # CRITICAL: Reject programs that don't use any inputs!
+        uses_input = any(token.startswith('LOAD_') for token in program)
+        if not uses_input and len(inputs[0]) > 0:
+            return 0  # Programs MUST use inputs!
+        
         n_correct = 0
         for i in range(len(inputs)):
             input_tuple = tuple(inputs[i].astype(int))
@@ -456,7 +263,6 @@ class NeurosymbolicTrainer:
     def _extract_equation(self, programs: List[List[str]], task_name: str,
                          n_inputs: int, n_outputs: int) -> str:
         """Extract the most common valid program"""
-        # Clean programs (remove PAD, DONE, etc.)
         cleaned = []
         for p in programs:
             clean_p = [t for t in p if t not in ['PAD', 'DONE', 'START']]
@@ -466,7 +272,6 @@ class NeurosymbolicTrainer:
         if not cleaned:
             return f"No valid program found"
         
-        # Find most common program
         most_common_tuple, count = Counter(cleaned).most_common(1)[0]
         program_tokens = list(most_common_tuple)
         

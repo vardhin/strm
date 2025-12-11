@@ -48,6 +48,10 @@ class SymbolicExecutor:
             
             step += 1
             
+            # Skip control tokens
+            if token in {'START', 'DONE', 'PAD'}:
+                continue
+            
             if token not in self.prims.primitives:
                 if trace:
                     print(f"❌ Unknown token: {token}")
@@ -130,13 +134,14 @@ class SymbolicExecutor:
                     b = a
                 
                 try:
-                    # Fix: Check if prim has 'function' or 'fn' attribute
-                    fn = getattr(prim, 'function', None) or getattr(prim, 'fn', None)
-                    if fn is None:
+                    if prim.function is None:
                         if self.verbose:
                             print(f"Primitive {token} has no callable function")
                         return None
-                    result = fn(a, b)
+                    result = prim.function(a, b)
+                    # Handle division by zero and invalid results
+                    if not isinstance(result, (int, float)) or np.isnan(result) or np.isinf(result):
+                        return None
                 except Exception as e:
                     if self.verbose:
                         print(f"Error executing {token}({a}, {b}): {e}")
@@ -160,13 +165,15 @@ class SymbolicExecutor:
                     a = inputs[0] if inputs else 0
                 
                 try:
-                    # Fix: Check if prim has 'function' or 'fn' attribute
-                    fn = getattr(prim, 'function', None) or getattr(prim, 'fn', None)
-                    if fn is None:
+                    # Use .function attribute consistently
+                    if prim.function is None:
                         if self.verbose:
                             print(f"Primitive {token} has no callable function")
                         return None
-                    result = fn(a)
+                    result = prim.function(a)
+                    # Handle invalid results
+                    if not isinstance(result, (int, float)) or np.isnan(result) or np.isinf(result):
+                        return None
                 except Exception as e:
                     if self.verbose:
                         print(f"Error executing {token}({a}): {e}")

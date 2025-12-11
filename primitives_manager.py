@@ -35,8 +35,9 @@ class PrimitivesManager:
     def _init_equation_primitives(self):
         """Bootstrap with ONLY operations needed for equations"""
         base_primitives = [
-            # Load arguments (MUST use these) - no function needed
-            *[Primitive(f"LOAD_{i}", self._get_next_id(), 0, 1, f"arg[{i}]", None) 
+            # Load arguments (MUST use these)
+            *[Primitive(f"LOAD_{i}", self._get_next_id(), 0, 1, f"arg[{i}]", 
+                       lambda i=i: lambda *args: None)  # Dummy function for LOAD
               for i in range(self.max_inputs)],
             
             # Basic arithmetic (the ONLY operations we need)
@@ -49,12 +50,12 @@ class PrimitivesManager:
             Primitive("NEG", self._get_next_id(), 1, 1, "-x", lambda x: -x),
             Primitive("SQUARE", self._get_next_id(), 1, 1, "x * x", lambda x: x * x),
             
-            # Constants (sometimes needed) - no function needed
-            Primitive("CONST_0", self._get_next_id(), 0, 1, "0", None),
-            Primitive("CONST_1", self._get_next_id(), 0, 1, "1", None),
-            Primitive("CONST_2", self._get_next_id(), 0, 1, "2", None),
+            # Constants (sometimes needed)
+            *[Primitive(f"CONST_{i}", self._get_next_id(), 0, 1, str(i),
+                       lambda i=i: i)  # Return constant directly
+              for i in range(10)],  # Add more constants if needed
             
-            # Control tokens - no function needed
+            # Control tokens
             Primitive("START", self._get_next_id(), 0, 0, "<start>", None),
             Primitive("DONE", self._get_next_id(), 0, 0, "<done>", None),
             Primitive("PAD", self._get_next_id(), 0, 0, "<pad>", None),
