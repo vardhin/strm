@@ -1,5 +1,6 @@
 import torch
-from typing import List, Tuple, Any, Optional
+import os
+from typing import List, Tuple, Any, Optional, Dict
 from symbolic import SymbolicRegistry, ProgramExecutor, CurriculumGenerator
 from trm import SymbolicTRMCore, SymbolicTRMCarry
 from layers import CastedLinear
@@ -199,24 +200,93 @@ class SymbolicAgent:
         print(f"  [Debug] Saving abstraction with loop_count={loop_count}")
         
         # Create executable function with correct loop_count captured in closure
-        def abstraction_fn(*inputs):
+        def abstraction_fn(inputs):  # Changed: don't use *inputs, just inputs
             return self.executor.execute_program(
                 primary_id, 
                 secondary_id, 
                 comp_type, 
-                list(inputs), 
+                inputs,  # Changed: removed list() wrapper since inputs is already a list
                 tertiary_id,
                 loop_count  # This captures the value in closure
             )
         
         # Register as new function with explicit arity
         # Note: layer will be auto-computed by registry._compute_layer()
-        new_id = self.registry.register(name, abstraction_fn, arity=arity)
+        layer = max(m['layer'] for m in self.registry.metadata.values()) + 1
+        new_id = self.registry.register(name, abstraction_fn, arity=arity, layer=layer)
+        
+        # IMPORTANT: Save composition metadata for reconstruction
+        self.registry.compositions[new_id] = {
+            'composition': comp_type,
+            'primary_id': primary_id,
+            'secondary_id': secondary_id,
+            'tertiary_id': tertiary_id,
+            'loop_count': loop_count
+        }
         
         # Update model to handle new vocabulary size
         self.resize_model(self.registry.get_vocab_size())
         
         return new_id
+    
+    def register_abstraction(self, name: str, primary_id: int, secondary_id: Optional[int], 
+                            tertiary_id: Optional[int], composition: str, 
+                            loop_count: int = 1) -> int:
+        """Register a new learned abstraction in the registry."""
+        print(f"  [Debug] Saving abstraction with loop_count={loop_count}")
+        
+        # Build the composed function
+        if composition == 'sequential':
+            if secondary_id == self.registry.loop_id:
+                # LOOP composition
+                composed_fn = self.registry._create_loop_function(primary_id, loop_count)
+                arity = self.registry.metadata[primary_id]['arity']
+            else:
+                # Sequential composition: f2(f1(x))
+                composed_fn = lambda inputs, p=primary_id, s=secondary_id: \
+                    self.registry.execute_function(s, [self.registry.execute_function(p, inputs)])
+                arity = self.registry.metadata[primary_id]['arity']
+        
+        elif composition == 'nested':
+            # Nested composition: f1(f2(x[0]), f2(x[1]), ...)
+            composed_fn = lambda inputs, p=primary_id, s=secondary_id: \
+                self.registry.execute_function(p, [self.registry.execute_function(s, [x]) for x in inputs])
+            arity = self.registry.metadata[secondary_id]['arity']
+        
+        elif composition == 'parallel':
+            # Parallel composition: tertiary(primary(inputs), secondary(inputs))
+            composed_fn = lambda inputs, p=primary_id, s=secondary_id, t=tertiary_id: \
+                self.registry.execute_function(t, [
+                    self.registry.execute_function(p, inputs),
+                    self.registry.execute_function(s, inputs)
+                ])
+            arity = self.registry.metadata[primary_id]['arity']
+        
+        else:
+            # Single function, no composition
+            composed_fn = lambda inputs, p=primary_id: \
+                self.registry.execute_function(p, inputs)
+            arity = self.registry.metadata[primary_id]['arity']
+        
+        # Register in registry
+        layer = max(m['layer'] for m in self.registry.metadata.values()) + 1
+        fid = self.registry.register(name, composed_fn, arity, layer)
+        
+        # IMPORTANT: Save composition metadata for reconstruction
+        self.registry.compositions[fid] = {
+            'composition': composition,
+            'primary_id': primary_id,
+            'secondary_id': secondary_id,
+            'tertiary_id': tertiary_id,
+            'loop_count': loop_count
+        }
+        
+        print(f"  [Memory] Saved '{name}' as Function ID {fid}")
+        
+        # Expand TRM vocabulary
+        self._expand_vocabulary(1)
+        
+        return fid
     
     def train_on_curriculum(self, num_epochs: int = 20):
         """Train model on curriculum tasks."""
@@ -250,3 +320,58 @@ class SymbolicAgent:
     def resize_model(self, new_vocab_size: int):
         """Resize model vocabulary (alias for resize_model_for_new_abstraction)."""
         self.resize_model_for_new_abstraction()
+    
+    def save(self, model_path: str, registry_path: str):
+        """Save model weights and registry."""
+        # Save model
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'training_history': self.training_history
+        }, model_path)
+        print(f"  [Agent] Model saved to {model_path}")
+        
+        # Save registry
+        self.registry.save(registry_path)
+    
+    def load(self, model_path: str, registry_path: str):
+        """Load model weights and registry."""
+        # Load registry first
+        self.registry.load(registry_path)
+        
+        # Update config with new vocab size
+        vocab_size = self.registry.get_vocab_size()
+        self.config['max_functions'] = vocab_size
+        
+        # Reinitialize model with new vocab size
+        self.model = SymbolicTRMCore(self.config)
+        
+        # Reinitialize optimizer
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
+        
+        # Load model weights
+        checkpoint = torch.load(model_path, map_location='cpu')
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.training_history = checkpoint.get('training_history', [])
+        
+        # Reinitialize searcher and trainer with updated model
+        self.searcher = ProgramSearcher(
+            self.registry, self.executor, self.model, 
+            self.config, self.training_history
+        )
+        self.trainer = TRMTrainer(
+            self.model, self.optimizer, self.config, self.registry
+        )
+        
+        print(f"  [Agent] Model loaded from {model_path}")
+        print(f"  [Agent] Vocabulary size: {vocab_size}")
+        print(f"  [Agent] Training history: {len(self.training_history)} episodes")
+    
+    def save_checkpoint(self, save_dir: str = "checkpoints"):
+        """Save checkpoint with timestamp."""
+        os.makedirs(save_dir, exist_ok=True)
+        model_path = os.path.join(save_dir, "model.pt")
+        registry_path = os.path.join(save_dir, "registry.pkl")
+        self.save(model_path, registry_path)
