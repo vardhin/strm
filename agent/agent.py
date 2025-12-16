@@ -9,17 +9,17 @@ from .training import TRMTrainer
 class SymbolicAgent:
     """Main orchestrator for symbolic reasoning with TRM."""
     
-    def __init__(self, registry: SymbolicRegistry, d_model=128, max_recursion=10):
+    def __init__(self, registry: SymbolicRegistry, d_model=128, max_recursion=10, input_dim=32):
         self.registry = registry
         self.executor = ProgramExecutor(registry)
-        self.curriculum_gen = CurriculumGenerator(registry)
+        self.curriculum_gen = CurriculumGenerator(registry, input_dim=input_dim)  # Pass input_dim!
         self.d_model = d_model
         self.max_recursion = max_recursion
         
-        # Configuration matching original TRM structure
+        # Configuration - allow custom input_dim
         self.config = {
-            'input_dim': 12,  # 4 examples * 3 values
-            'seq_len': 4,     # Number of I/O examples
+            'input_dim': input_dim,
+            'seq_len': 4,
             'hidden_size': d_model,
             'expansion': 2.0,
             'num_heads': 4,
@@ -58,27 +58,40 @@ class SymbolicAgent:
         )
 
     def format_examples(self, examples: List[Tuple[List[int], Any]]) -> torch.Tensor:
+        """Format examples into tensor for TRM input.
+        
+        Each input value occupies one position in the sequence.
+        We encode each integer using input_dim features.
+        Pad to seq_len positions with zeros.
+        
+        Returns: [batch_size, seq_len, input_dim]
         """
-        Convert I/O examples to structured format with explicit I/O separation.
-        Shape: [batch, num_examples, 3] where each row is [input1, input2, output]
-        """
-        data = []
-        for inputs, output in examples:
-            # Pad unary inputs to binary (2 inputs)
-            if len(inputs) == 1:
-                padded_inputs = inputs + [0]
-            else:
-                padded_inputs = inputs[:2]
+        import torch
+        
+        input_dim = self.config['input_dim']  # bits per integer
+        seq_len = self.config['seq_len']      # max sequence positions
+        batch_size = len(examples)
+        
+        # Create tensor: [batch_size, seq_len, input_dim]
+        batch_data = torch.zeros(batch_size, seq_len, input_dim, dtype=torch.float32)
+        
+        for batch_idx, (inputs, _) in enumerate(examples):
+            num_inputs = min(len(inputs), seq_len)
             
-            data.append(padded_inputs + [output])
+            for pos in range(num_inputs):
+                val = inputs[pos]
+                
+                # Convert integer to binary representation
+                if val >= 0:
+                    bits = [(val >> i) & 1 for i in range(input_dim)]
+                else:
+                    # Two's complement for negative
+                    unsigned = (1 << input_dim) + val
+                    bits = [(unsigned >> i) & 1 for i in range(input_dim)]
+                
+                batch_data[batch_idx, pos] = torch.tensor(bits, dtype=torch.float32)
         
-        # Pad to fixed size (4 examples)
-        while len(data) < self.config['seq_len']:
-            data.append([0, 0, 0])
-        
-        # Flatten for model input
-        flat_data = [val for row in data for val in row]
-        return torch.tensor([flat_data], dtype=torch.float32)
+        return batch_data
 
     def resize_model_for_new_abstraction(self):
         """Dynamically resize output heads when new function is learned."""
@@ -108,25 +121,24 @@ class SymbolicAgent:
     def search_with_recursive_trm(self, examples: List[Tuple[List[int], Any]], 
                                   task_name: str = "Unknown",
                                   exploration_bonus: float = 0.5) -> Optional[dict]:
-        """
-        Use TRM's recursive reasoning with learned heuristics and exploration.
-        """
-        print(f"\n--- Searching for: {task_name} ---")
-        
-        # Bootstrap with exhaustive search for primitives only
-        if self.registry.get_vocab_size() <= 3:
-            print(f"  [Bootstrap] Using exhaustive search (vocab size = {self.registry.get_vocab_size()})")
-            program = self.searcher.exhaustive_search(examples)
-            if program is not None:
-                self._print_found_program(program, exhaustive=True)
-                return program
-        
-        # TRM-based learned search
+        """Search for program using TRM heuristics with fallback to exhaustive."""
         x_input = self.format_examples(examples)
         carry = self.initial_carry(batch_size=1)
-        carry = self.model.reset_carry(carry.halted, carry)
         
-        return self.searcher.trm_search(examples, task_name, x_input, carry, exploration_bonus)
+        # Try TRM search first (only if we have enough functions)
+        if self.registry.get_vocab_size() > 3:
+            result = self.searcher.trm_search(examples, task_name, x_input, carry, exploration_bonus)
+            if result:
+                self._print_found_program(result, exhaustive=False)
+                return result
+        
+        # Fallback to exhaustive
+        print(f"  [Bootstrap] Using exhaustive search (vocab size = {self.registry.get_vocab_size()})")
+        result = self.searcher.exhaustive_search(examples)
+        if result:
+            print(f"  [Success] Found via exhaustive search")
+            self._print_found_program(result, exhaustive=True)
+        return result
     
     def _print_found_program(self, program: dict, exhaustive: bool = False):
         """Print discovered program."""
@@ -140,59 +152,98 @@ class SymbolicAgent:
         print(f"    Composition: {program['comp_type']}")
 
     def learn_abstraction(self, name: str, examples: List[Tuple[List[int], Any]], 
-                         num_epochs: int = 50) -> bool:
-        """Full pipeline: Search -> Train -> Save -> Resize"""
+                         num_epochs: int = 30, exploration_bonus: float = 0.5) -> bool:
+        """Learn a new abstraction from examples."""
         print(f"\n{'='*60}")
         print(f"Learning Abstraction: {name}")
-        print(f"{'='*60}")
+        print(f"{'='*60}\n")
         
-        # Search
-        program = self.search_with_recursive_trm(examples, task_name=name)
+        # Search for program
+        program = self.search_with_recursive_trm(examples, name, exploration_bonus)
         
-        if program is None:
+        if not program:
+            print(f"\n  [Failed] Could not find program for {name}")
             return False
         
-        # Train
-        train_message = "Refining TRM search..." if program['step'] > 0 else "Found via exhaustive search, training TRM to predict it..."
-        print(f"\n  [Training] {train_message}")
+        # Detect arity from examples
+        input_arity = len(examples[0][0])
+        
+        # Train TRM to predict this program
+        print(f"\n  [Training] Found via {'TRM' if 'TRM' in str(program.get('source', 'exhaustive')) else 'exhaustive search'}, training TRM to predict it...")
+        self.train_on_program(program, examples, num_epochs)
+        
+        # Save as new abstraction with correct arity
+        new_id = self.save_abstraction(name, program, input_arity)
+        print(f"\n  [Memory] Saved '{name}' as Function ID {new_id}")
+        print(f"  [Resize] Model vocabulary expanded to {self.registry.get_vocab_size()} functions")
+        
+        return True
+    
+    def save_abstraction(self, name: str, program: dict, arity: int) -> int:
+        """Save a learned program as a new named function."""
+        # Extract program structure
+        primary_id = program['primary_id']
+        secondary_id = program['secondary_id']
+        tertiary_id = program.get('tertiary_id')
+        comp_type = program['comp_type']
+        loop_count = program.get('loop_count', 1)
+        
+        # Validate loop_count is properly captured
+        if secondary_id == self.registry.loop_id and loop_count == 1:
+            print(f"  [Warning] LOOP detected but loop_count=1, may be unintended")
+        
+        # Debug: print what we're saving
+        print(f"  [Debug] Saving abstraction with loop_count={loop_count}")
+        
+        # Create executable function with correct loop_count captured in closure
+        def abstraction_fn(*inputs):
+            return self.executor.execute_program(
+                primary_id, 
+                secondary_id, 
+                comp_type, 
+                list(inputs), 
+                tertiary_id,
+                loop_count  # This captures the value in closure
+            )
+        
+        # Register as new function with explicit arity
+        # Note: layer will be auto-computed by registry._compute_layer()
+        new_id = self.registry.register(name, abstraction_fn, arity=arity)
+        
+        # Update model to handle new vocabulary size
+        self.resize_model(self.registry.get_vocab_size())
+        
+        return new_id
+    
+    def train_on_curriculum(self, num_epochs: int = 20):
+        """Train model on curriculum tasks."""
+        self.trainer.train_on_curriculum(
+            self.curriculum_gen,
+            self.format_examples,  # ← This is the format_fn
+            self.training_history,
+            num_epochs=num_epochs
+        )
+    
+    def train_on_program(self, program: dict, examples: List[Tuple[List[int], Any]], 
+                        num_epochs: int = 30):
+        """Train TRM to predict a discovered program."""
+        print(f"  [Training] Teaching TRM to predict this composition...")
         
         for epoch in range(num_epochs):
             loss = self.trainer.train_step(examples, program, self.format_examples)
             if epoch % 10 == 0:
                 print(f"    Epoch {epoch}: Loss = {loss:.4f}")
         
-        # Save
-        def learned_function(*args):
-            return self.executor.execute_program(
-                program['primary_id'],
-                program['secondary_id'],
-                program['comp_type'],
-                list(args),
-                program.get('tertiary_id')
-            )
-        
-        arity = len(examples[0][0])
-        new_id = self.registry.register(name, learned_function, arity=arity)
-        print(f"\n  [Memory] Saved '{name}' as Function ID {new_id}")
-        
-        # Resize
-        self.resize_model_for_new_abstraction()
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
-        
+        # Add to training history
         self.training_history.append({
-            'name': name,
-            'id': new_id,
+            'name': program.get('name', 'Unknown'),
+            'id': None,  # Will be filled when saved
             'program': program,
             'examples': examples
         })
         
-        return True
-
-    def train_on_curriculum(self, num_epochs: int = 20):
-        """Pre-train on curriculum tasks."""
-        self.trainer.train_on_curriculum(
-            self.curriculum_gen, 
-            self.format_examples, 
-            self.training_history, 
-            num_epochs
-        )
+        print(f"  [Training] Complete!")
+    
+    def resize_model(self, new_vocab_size: int):
+        """Resize model vocabulary (alias for resize_model_for_new_abstraction)."""
+        self.resize_model_for_new_abstraction()

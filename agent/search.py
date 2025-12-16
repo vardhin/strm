@@ -17,9 +17,18 @@ class ProgramSearcher:
     def exhaustive_search(self, examples: List[Tuple[List[int], Any]]) -> Optional[Dict]:
         """Exhaustive search with 3-function compositions."""
         vocab_size = self.registry.get_vocab_size()
+        loop_id = self.registry.loop_id
+        input_arity = len(examples[0][0])
         
         # Try single operations
         for primary_id in range(vocab_size):
+            if primary_id == loop_id:
+                continue
+            # Check arity compatibility
+            func_arity = self.registry.metadata[primary_id]['arity']
+            if func_arity > 1 and input_arity < func_arity:
+                continue
+            
             if self.executor.validate_program(primary_id, 0, 'none', examples):
                 return {
                     'primary_id': primary_id,
@@ -27,12 +36,37 @@ class ProgramSearcher:
                     'tertiary_id': None,
                     'comp_type': 'none',
                     'score': 1.0,
-                    'step': 0
+                    'step': 0,
+                    'loop_count': 1
                 }
         
         # Try 2-function compositions
         for primary_id in range(vocab_size):
+            if primary_id == loop_id:
+                continue
+            
+            # Check arity compatibility
+            func_arity = self.registry.metadata[primary_id]['arity']
+            if func_arity > 1 and input_arity < func_arity:
+                continue
+            
             for secondary_id in range(vocab_size):
+                # LOOP special case: try as sequential with different counts
+                if secondary_id == loop_id:
+                    for loop_count in [2, 3, 4, 5, 1]:  # Try 2 first!
+                        if self.executor.validate_program(primary_id, secondary_id, 'sequential', examples, loop_count=loop_count):
+                            return {
+                                'primary_id': primary_id,
+                                'secondary_id': secondary_id,
+                                'tertiary_id': None,
+                                'comp_type': 'sequential',
+                                'score': 1.0,
+                                'step': 0,
+                                'loop_count': loop_count
+                            }
+                    continue
+                
+                # Regular compositions
                 for comp_type in ['sequential', 'nested']:
                     if self.executor.validate_program(primary_id, secondary_id, comp_type, examples):
                         return {
@@ -41,22 +75,31 @@ class ProgramSearcher:
                             'tertiary_id': None,
                             'comp_type': comp_type,
                             'score': 1.0,
-                            'step': 0
+                            'step': 0,
+                            'loop_count': 1
                         }
         
-        # Try 3-function parallel composition
-        for primary_id in range(vocab_size):
-            for secondary_id in range(vocab_size):
-                for tertiary_id in range(vocab_size):
-                    if self.executor.validate_program(primary_id, secondary_id, 'parallel', examples, tertiary_id):
-                        return {
-                            'primary_id': primary_id,
-                            'secondary_id': secondary_id,
-                            'tertiary_id': tertiary_id,
-                            'comp_type': 'parallel',
-                            'score': 1.0,
-                            'step': 0
-                        }
+        # Try 3-function parallel composition (only for binary inputs)
+        if input_arity >= 2:
+            for primary_id in range(vocab_size):
+                if primary_id == loop_id:
+                    continue
+                for secondary_id in range(vocab_size):
+                    if secondary_id == loop_id:
+                        continue
+                    for tertiary_id in range(vocab_size):
+                        if tertiary_id == loop_id:
+                            continue
+                        if self.executor.validate_program(primary_id, secondary_id, 'parallel', examples, tertiary_id):
+                            return {
+                                'primary_id': primary_id,
+                                'secondary_id': secondary_id,
+                                'tertiary_id': tertiary_id,
+                                'comp_type': 'parallel',
+                                'score': 1.0,
+                                'step': 0,
+                                'loop_count': 1
+                            }
         
         return None
     
@@ -68,6 +111,10 @@ class ProgramSearcher:
         
         self.model.eval()
         candidates = []
+        
+        # Detect input arity from examples
+        input_arity = len(examples[0][0])
+        print(f"    Detected input arity: {input_arity}")
         
         # Build layer-based priors
         layer_functions = {}
@@ -106,9 +153,9 @@ class ProgramSearcher:
                                             secondary_probs_adjusted, comp_probs, 
                                             primary_probs, secondary_probs, recent_usage)
                 
-                # Generate candidates
+                # Generate candidates (with input arity filtering)
                 candidates.extend(self._generate_candidates(
-                    primary_probs_adjusted, secondary_probs_adjusted, comp_probs, outputs, step
+                    primary_probs_adjusted, secondary_probs_adjusted, comp_probs, outputs, step, input_arity
                 ))
                 
                 if outputs['confidence'][0] > 0.8 or step >= 5:
@@ -134,9 +181,11 @@ class ProgramSearcher:
         
         return primary_probs_adjusted, secondary_probs_adjusted
     
-    def _generate_candidates(self, primary_probs, secondary_probs, comp_probs, outputs, step):
-        """Generate candidate programs from predictions."""
+    def _generate_candidates(self, primary_probs, secondary_probs, comp_probs, outputs, step, input_arity=2):
+        """Generate candidate programs from model predictions."""
         candidates = []
+        seen_programs = set()  # Add deduplication
+        
         vocab_size = self.registry.get_vocab_size()
         top_k = min(vocab_size, 5)
         
@@ -144,32 +193,89 @@ class ProgramSearcher:
         secondary_top = torch.topk(secondary_probs[0], top_k)
         comp_top = torch.topk(comp_probs[0], min(4, comp_probs.shape[-1]))
         
-        # 3-function parallel compositions
+        loop_id = self.registry.loop_id
+        
+        # Filter functions by arity compatibility
+        def is_compatible(func_id, required_arity):
+            """Check if function can handle the required arity."""
+            func_arity = self.registry.metadata[func_id]['arity']
+            # Unary functions always work
+            if func_arity == 1:
+                return True
+            # Binary functions need 2 inputs
+            if func_arity == 2:
+                return required_arity >= 2
+            # LOOP is special - works with any arity
+            if func_id == loop_id:
+                return True
+            return False
+        
+        # For parallel composition: only generate if we have binary inputs
+        if input_arity >= 2:
+            for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
+                # LOOP cannot be primary
+                if p_idx.item() == loop_id:
+                    print(f"      [Debug] Skipping LOOP as primary (prob={p_prob:.4f})")
+                    continue
+                if not is_compatible(p_idx.item(), input_arity):
+                    continue
+                    
+                for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
+                    # LOOP cannot be in parallel
+                    if s_idx.item() == loop_id:
+                        continue
+                    if not is_compatible(s_idx.item(), input_arity):
+                        continue
+                    
+                    for t_idx in range(vocab_size):
+                        if t_idx == loop_id:
+                            continue
+                        
+                        t_prob = primary_probs[0, t_idx]
+                        
+                        p_layer = self.registry.metadata[p_idx.item()]['layer']
+                        s_layer = self.registry.metadata[s_idx.item()]['layer']
+                        t_layer = self.registry.metadata[t_idx]['layer']
+                        
+                        diversity_bonus = 1.5 if len(set([p_layer, s_layer, t_layer])) > 1 else 1.0
+                        score = (p_prob * s_prob * t_prob * outputs['confidence'][0] * diversity_bonus).item()
+                        
+                        candidates.append({
+                            'primary_id': p_idx.item(),
+                            'secondary_id': s_idx.item(),
+                            'tertiary_id': t_idx,
+                            'comp_type': 'parallel',
+                            'score': score,
+                            'step': step,
+                            'loop_count': 1
+                        })
+        
+        # 2-function compositions (all arities)
         for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
-            for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
-                for t_idx in range(vocab_size):
-                    t_prob = primary_probs[0, t_idx]
-                    
-                    p_layer = self.registry.metadata[p_idx.item()]['layer']
-                    s_layer = self.registry.metadata[s_idx.item()]['layer']
-                    t_layer = self.registry.metadata[t_idx]['layer']
-                    
-                    diversity_bonus = 1.5 if len(set([p_layer, s_layer, t_layer])) > 1 else 1.0
-                    score = (p_prob * s_prob * t_prob * outputs['confidence'][0] * diversity_bonus).item()
-                    
-                    candidates.append({
-                        'primary_id': p_idx.item(),
-                        'secondary_id': s_idx.item(),
-                        'tertiary_id': t_idx,
-                        'comp_type': 'parallel',
-                        'score': score,
-                        'step': step
-                    })
+            # LOOP cannot be primary function
+            if p_idx.item() == loop_id:
+                continue
                 
-                # 2-function compositions
+            # Primary must be compatible with input arity
+            if not is_compatible(p_idx.item(), input_arity):
+                continue
+                
+            for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
                 for c_idx, c_prob in zip(comp_top.indices, comp_top.values):
                     comp_types = ['none', 'sequential', 'nested', 'parallel']
                     comp_type = comp_types[c_idx.item()]
+                    
+                    # Skip parallel for unary inputs
+                    if comp_type == 'parallel' and input_arity == 1:
+                        continue
+                    
+                    # LOOP only valid in sequential composition (and only as secondary)
+                    if comp_type == 'parallel' and s_idx.item() == loop_id:
+                        continue
+                    if comp_type == 'nested' and s_idx.item() == loop_id:
+                        continue
+                    if comp_type == 'none' and s_idx.item() == loop_id:
+                        continue
                     
                     if comp_type != 'parallel':
                         p_layer = self.registry.metadata[p_idx.item()]['layer']
@@ -178,14 +284,43 @@ class ProgramSearcher:
                         diversity_bonus = 1.5 if (comp_type != 'none' and p_layer != s_layer) else 1.0
                         score = (p_prob * s_prob * c_prob * outputs['confidence'][0] * diversity_bonus).item()
                         
-                        candidates.append({
-                            'primary_id': p_idx.item(),
-                            'secondary_id': s_idx.item(),
-                            'tertiary_id': None,
-                            'comp_type': comp_type,
-                            'score': score,
-                            'step': step
-                        })
+                        # If secondary is LOOP, try different loop counts
+                        if s_idx.item() == loop_id and comp_type == 'sequential':
+                            for loop_count in [2, 3, 1, 4, 5]:  # Prioritize 2 and 3
+                                candidates.append({
+                                    'primary_id': p_idx.item(),
+                                    'secondary_id': s_idx.item(),
+                                    'tertiary_id': None,
+                                    'comp_type': comp_type,
+                                    'score': score * (1.5 if loop_count == 2 else 1.0) / loop_count,  # Bonus for loop_count=2
+                                    'step': step,
+                                    'loop_count': loop_count
+                                })
+                        else:
+                            candidates.append({
+                                'primary_id': p_idx.item(),
+                                'secondary_id': s_idx.item(),
+                                'tertiary_id': None,
+                                'comp_type': comp_type,
+                                'score': score,
+                                'step': step,
+                                'loop_count': 1
+                            })
+        
+        # Deduplicate candidates
+        for candidate in candidates:
+            # Create unique key for program
+            program_key = (
+                candidate['primary_id'],
+                candidate['secondary_id'],
+                candidate.get('tertiary_id'),
+                candidate['comp_type'],
+                candidate.get('loop_count', 1)
+            )
+            
+            if program_key not in seen_programs:
+                seen_programs.add(program_key)
+                candidates.append(candidate)
         
         return candidates
     
@@ -199,19 +334,22 @@ class ProgramSearcher:
             p_name = self.registry.metadata[candidate['primary_id']]['name']
             s_name = self.registry.metadata[candidate['secondary_id']]['name']
             t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
-            print(f"        {i+1}. {p_name} + {s_name} + {t_name} ({candidate['comp_type']}): {candidate['score']:.6f}")
+            loop_info = f" (n={candidate.get('loop_count', 1)})" if s_name == 'LOOP' else ""
+            print(f"        {i+1}. {p_name} + {s_name}{loop_info} + {t_name} ({candidate['comp_type']}): {candidate['score']:.6f}")
         
         for i, candidate in enumerate(candidates[:100]):
             if i < 10:
                 if self._validate_and_print(candidate, examples, i):
                     return candidate
             else:
+                # Quick validation without printing
                 if self.executor.validate_program(
                     candidate['primary_id'],
                     candidate['secondary_id'],
                     candidate['comp_type'],
                     examples,
-                    candidate.get('tertiary_id')
+                    candidate.get('tertiary_id'),
+                    candidate.get('loop_count', 1)
                 ):
                     self._print_success(candidate, i)
                     return candidate
@@ -225,7 +363,8 @@ class ProgramSearcher:
         s_name = self.registry.metadata[candidate['secondary_id']]['name']
         t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
         
-        print(f"\n      Testing Rank {rank+1}: {p_name} + {s_name} + {t_name} ({candidate['comp_type']})")
+        loop_info = f" (loop_count={candidate.get('loop_count', 1)})" if s_name == 'LOOP' else ""
+        print(f"\n      Testing Rank {rank+1}: {p_name} + {s_name}{loop_info} + {t_name} ({candidate['comp_type']})")
         print(f"        Executing on examples:")
         
         all_match = True
@@ -236,7 +375,8 @@ class ProgramSearcher:
                     candidate['secondary_id'],
                     candidate['comp_type'],
                     inp,
-                    candidate.get('tertiary_id')
+                    candidate.get('tertiary_id'),
+                    candidate.get('loop_count', 1)
                 )
                 match = result == expected
                 all_match = all_match and match
@@ -260,6 +400,8 @@ class ProgramSearcher:
         print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {rank+1}/100)")
         print(f"    Primary: {p_name}")
         print(f"    Secondary: {s_name}")
+        if s_name == 'LOOP':
+            print(f"    Loop count: {candidate.get('loop_count', 1)}")
         if t_name:
             print(f"    Tertiary: {t_name}")
         print(f"    Composition: {candidate['comp_type']}")
