@@ -345,19 +345,19 @@ class SymbolicAgent:
         return torch.tensor([data], dtype=torch.float32)
 
     def execute_program(self, primary_id: int, secondary_id: Optional[int], 
-                       comp_type: str, inputs: List[int]) -> Any:
-        """Execute a symbolic program on given inputs."""
+                       comp_type: str, inputs: List[int], tertiary_id: Optional[int] = None) -> Any:
+        """Execute a symbolic program on given inputs (now supports 3-function composition)."""
         primary_meta = self.registry.metadata[primary_id]
         
         if comp_type == 'none':
-            # Handle arity correctly
+            # Single function
             if primary_meta['arity'] == 1:
                 return self.registry.execute_function(primary_id, [inputs[0]])
             else:
                 return self.registry.execute_function(primary_id, inputs)
                 
         elif comp_type == 'sequential':
-            # f2(f1(x, y), ...)
+            # f2(f1(x, y))
             result1 = self.registry.execute_function(primary_id, inputs)
             secondary_meta = self.registry.metadata[secondary_id]
             if secondary_meta['arity'] == 1:
@@ -366,87 +366,194 @@ class SymbolicAgent:
                 return self.registry.execute_function(secondary_id, [result1] + inputs[1:])
                 
         elif comp_type == 'nested':
-            # f1(x, f2(y, z)) or f1(x, f2(x))
+            # f1(x, f2(x, y))
             secondary_meta = self.registry.metadata[secondary_id]
             if secondary_meta['arity'] == 1:
-                # For NOT: f1(x, f2(x))
                 result2 = self.registry.execute_function(secondary_id, [inputs[0]])
                 return self.registry.execute_function(primary_id, [inputs[0], result2])
             elif secondary_meta['arity'] == 2 and len(inputs) >= 2:
-                # For binary ops: f1(x, f2(x, y))
                 result2 = self.registry.execute_function(secondary_id, inputs)
                 return self.registry.execute_function(primary_id, [inputs[0], result2])
             else:
                 return None
                 
         elif comp_type == 'parallel':
-            result1 = self.registry.execute_function(primary_id, inputs)
-            result2 = self.registry.execute_function(secondary_id, inputs)
-            return (result1, result2)
+            # f_tertiary(f_primary(x, y), f_secondary(x, y))
+            # This enables: XOR = AND(OR(x,y), NAND(x,y))
+            
+            # Execute primary and secondary - handle arity properly
+            primary_meta = self.registry.metadata[primary_id]
+            secondary_meta = self.registry.metadata[secondary_id]
+            
+            # Get correct number of arguments for each function
+            if primary_meta['arity'] == 1:
+                result1 = self.registry.execute_function(primary_id, [inputs[0]])
+            else:
+                result1 = self.registry.execute_function(primary_id, inputs[:primary_meta['arity']])
+                
+            if secondary_meta['arity'] == 1:
+                result2 = self.registry.execute_function(secondary_id, [inputs[0]])
+            else:
+                result2 = self.registry.execute_function(secondary_id, inputs[:secondary_meta['arity']])
+            
+            # If tertiary_id specified, use it as combiner
+            if tertiary_id is not None:
+                tertiary_meta = self.registry.metadata[tertiary_id]
+                if tertiary_meta['arity'] == 2:
+                    return self.registry.execute_function(tertiary_id, [result1, result2])
+                elif tertiary_meta['arity'] == 1:
+                    # Unary combiner - just return first result
+                    return self.registry.execute_function(tertiary_id, [result1])
+            
+            # Default: try AND as combiner for backward compatibility
+            if isinstance(result1, int) and isinstance(result2, int):
+                return result1 & result2
+            else:
+                return (result1, result2)
             
         return None
 
     def validate_program(self, primary_id: int, secondary_id: Optional[int],
-                        comp_type: str, examples: List[Tuple[List[int], Any]]) -> bool:
+                        comp_type: str, examples: List[Tuple[List[int], Any]], 
+                        tertiary_id: Optional[int] = None) -> bool:
         """Validate a symbolic program against examples."""
         for inputs, expected_output in examples:
             try:
-                result = self.execute_program(primary_id, secondary_id, comp_type, inputs)
+                result = self.execute_program(primary_id, secondary_id, comp_type, inputs, tertiary_id)
                 if result != expected_output:
                     return False
-            except (IndexError, TypeError, KeyError):
+            except (IndexError, TypeError, KeyError, Exception):
                 return False
         return True
 
     def exhaustive_search(self, examples: List[Tuple[List[int], Any]]) -> Optional[Dict]:
-        """Exhaustive search over all possible programs."""
+        """Exhaustive search with 3-function compositions."""
         vocab_size = self.registry.get_vocab_size()
         
-        # Try single operations first
+        # Try single operations
         for primary_id in range(vocab_size):
             if self.validate_program(primary_id, 0, 'none', examples):
                 return {
                     'primary_id': primary_id,
                     'secondary_id': 0,
+                    'tertiary_id': None,
                     'comp_type': 'none',
                     'score': 1.0,
                     'step': 0
                 }
         
-        # Try all compositions
+        # Try 2-function compositions
         for primary_id in range(vocab_size):
             for secondary_id in range(vocab_size):
-                for comp_type in ['sequential', 'nested', 'parallel']:
+                for comp_type in ['sequential', 'nested']:
                     if self.validate_program(primary_id, secondary_id, comp_type, examples):
                         return {
                             'primary_id': primary_id,
                             'secondary_id': secondary_id,
+                            'tertiary_id': None,
                             'comp_type': comp_type,
+                            'score': 1.0,
+                            'step': 0
+                        }
+        
+        # Try 3-function parallel composition: tertiary(primary(x,y), secondary(x,y))
+        for primary_id in range(vocab_size):
+            for secondary_id in range(vocab_size):
+                for tertiary_id in range(vocab_size):
+                    if self.validate_program(primary_id, secondary_id, 'parallel', examples, tertiary_id):
+                        return {
+                            'primary_id': primary_id,
+                            'secondary_id': secondary_id,
+                            'tertiary_id': tertiary_id,
+                            'comp_type': 'parallel',
                             'score': 1.0,
                             'step': 0
                         }
         
         return None
 
+    def generate_curriculum_tasks(self) -> List[Tuple[str, List[Tuple[List[int], Any]], Dict]]:
+        """Generate synthetic tasks to teach compositional search."""
+        tasks = []
+        
+        # Task 1: Teach basic single-function usage
+        tasks.append((
+            "OR_identity",
+            [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 1)],
+            {'primary_id': 0, 'secondary_id': 0, 'tertiary_id': None, 'comp_type': 'none', 'step': 0}
+        ))
+        
+        tasks.append((
+            "AND_identity", 
+            [([0, 0], 0), ([0, 1], 0), ([1, 0], 0), ([1, 1], 1)],
+            {'primary_id': 1, 'secondary_id': 0, 'tertiary_id': None, 'comp_type': 'none', 'step': 0}
+        ))
+        
+        # Task 2: Teach sequential composition (builds on primitives)
+        tasks.append((
+            "NOT_OR",  # NOT(OR(x,y))
+            [([0, 0], 1), ([0, 1], 0), ([1, 0], 0), ([1, 1], 0)],
+            {'primary_id': 0, 'secondary_id': 2, 'tertiary_id': None, 'comp_type': 'sequential', 'step': 0}
+        ))
+        
+        tasks.append((
+            "NOT_AND",  # NOT(AND(x,y)) - this will become NAND
+            [([0, 0], 1), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)],
+            {'primary_id': 1, 'secondary_id': 2, 'tertiary_id': None, 'comp_type': 'sequential', 'step': 0}
+        ))
+        
+        return tasks
+
+    def train_on_curriculum(self, num_epochs: int = 20):
+        """Pre-train TRM on synthetic curriculum tasks."""
+        print("\n" + "="*60)
+        print("Training on Curriculum Tasks")
+        print("="*60)
+        
+        tasks = self.generate_curriculum_tasks()
+        
+        for task_name, examples, target_program in tasks:
+            print(f"\n  [Curriculum] Learning: {task_name}")
+            print(f"    Target: {self.registry.metadata[target_program['primary_id']]['name']}", end="")
+            if target_program['comp_type'] != 'none':
+                print(f" + {self.registry.metadata[target_program['secondary_id']]['name']} ({target_program['comp_type']})")
+            else:
+                print()
+            
+            for epoch in range(num_epochs):
+                loss = self.train_step(examples, target_program)
+                if epoch % 10 == 0:
+                    print(f"      Epoch {epoch}: Loss = {loss:.4f}")
+        
+        print("\n  [Curriculum] Pre-training complete!")
+
     def search_with_recursive_trm(self, examples: List[Tuple[List[int], Any]], 
-                                  task_name: str = "Unknown") -> Optional[Dict]:
+                                  task_name: str = "Unknown",
+                                  exploration_bonus: float = 0.1) -> Optional[Dict]:
         """
-        Use TRM's recursive reasoning to find valid program.
-        Falls back to exhaustive search if needed.
+        Use TRM's recursive reasoning with:
+        1. Learned heuristics
+        2. Exploration bonuses (penalize recent predictions)
+        3. Top-down layer prioritization
         """
         print(f"\n--- Searching for: {task_name} ---")
         
-        # First try exhaustive search (for bootstrapping)
-        program = self.exhaustive_search(examples)
-        if program is not None:
-            print(f"  [Success] Found via exhaustive search")
-            print(f"    Primary: {self.registry.metadata[program['primary_id']]['name']}")
-            if program['comp_type'] != 'none':
-                print(f"    Secondary: {self.registry.metadata[program['secondary_id']]['name']}")
-            print(f"    Composition: {program['comp_type']}")
-            return program
+        # Only use exhaustive search for very early bootstrapping (just primitives)
+        if self.registry.get_vocab_size() <= 3:
+            print(f"  [Bootstrap] Using exhaustive search (vocab size = {self.registry.get_vocab_size()})")
+            program = self.exhaustive_search(examples)
+            if program is not None:
+                print(f"  [Success] Found via exhaustive search")
+                print(f"    Primary: {self.registry.metadata[program['primary_id']]['name']}")
+                if program['comp_type'] != 'none':
+                    print(f"    Secondary: {self.registry.metadata[program['secondary_id']]['name']}")
+                if program['tertiary_id'] is not None:
+                    print(f"    Tertiary: {self.registry.metadata[program['tertiary_id']]['name']}")
+                print(f"    Composition: {program['comp_type']}")
+                return program
         
-        # Then try TRM-based search
+        # TRM-based learned search with semantic priors
+        print(f"  [TRM Search] Using learned heuristics (vocab size = {self.registry.get_vocab_size()})...")
         x_input = self.format_examples(examples)
         carry = self.initial_carry(batch_size=1)
         carry = self.model.reset_carry(carry.halted, carry)
@@ -454,58 +561,211 @@ class SymbolicAgent:
         self.model.eval()
         candidates = []
         
+        # Build layer-based priors (top-down preference)
+        layer_functions = {}
+        for fid, meta in self.registry.metadata.items():
+            layer = meta['layer']
+            if layer not in layer_functions:
+                layer_functions[layer] = []
+            layer_functions[layer].append(fid)
+        
+        # Penalize recently used functions (exploration bonus)
+        recent_usage = {}
+        for history_item in self.training_history[-3:]:  # Last 3 tasks
+            prog = history_item['program']
+            recent_usage[prog['primary_id']] = recent_usage.get(prog['primary_id'], 0) + 1
+            recent_usage[prog['secondary_id']] = recent_usage.get(prog['secondary_id'], 0) + 1
+            if prog.get('tertiary_id') is not None:
+                recent_usage[prog['tertiary_id']] = recent_usage.get(prog['tertiary_id'], 0) + 1
+        
+        print(f"    Available functions by layer:")
+        for layer in sorted(layer_functions.keys(), reverse=True):  # Show top-down
+            func_names = [self.registry.metadata[fid]['name'] for fid in layer_functions[layer]]
+            print(f"      Layer {layer}: {func_names}")
+        
+        if recent_usage:
+            print(f"    Recent usage penalties:")
+            for fid, count in sorted(recent_usage.items(), key=lambda x: x[1], reverse=True)[:3]:
+                print(f"      {self.registry.metadata[fid]['name']}: -{exploration_bonus * count:.3f}")
+        
         with torch.no_grad():
             for step in range(self.config['halt_max_steps']):
                 carry, outputs = self.model(carry, x_input)
                 
-                # Extract predictions
                 primary_probs = F.softmax(outputs['primary_logits'], dim=-1)
                 secondary_probs = F.softmax(outputs['secondary_logits'], dim=-1)
                 comp_probs = F.softmax(outputs['composition_logits'], dim=-1)
                 
-                # Get top candidates
-                top_k = 3
-                primary_top = torch.topk(primary_probs[0], min(top_k, primary_probs.shape[-1]))
-                secondary_top = torch.topk(secondary_probs[0], min(top_k, secondary_probs.shape[-1]))
+                # Apply exploration bonus (penalize recent predictions)
+                primary_probs_adjusted = primary_probs.clone()
+                secondary_probs_adjusted = secondary_probs.clone()
+                
+                for fid, count in recent_usage.items():
+                    penalty = exploration_bonus * count
+                    primary_probs_adjusted[0, fid] *= (1 - penalty)
+                    secondary_probs_adjusted[0, fid] *= (1 - penalty)
+                
+                # Renormalize after penalty
+                primary_probs_adjusted = primary_probs_adjusted / primary_probs_adjusted.sum()
+                secondary_probs_adjusted = secondary_probs_adjusted / secondary_probs_adjusted.sum()
+                
+                print(f"\n    [Step {step}] TRM Predictions:")
+                print(f"      Confidence: {outputs['confidence'][0].item():.4f}")
+                
+                # Show top-3 for each prediction (after exploration bonus)
+                vocab_size = self.registry.get_vocab_size()
+                print(f"      Top-3 Primary (after exploration bonus):")
+                top_primary = torch.topk(primary_probs_adjusted[0], min(3, vocab_size))
+                for i in range(len(top_primary.indices)):
+                    idx = top_primary.indices[i].item()
+                    prob = top_primary.values[i].item()
+                    original_prob = primary_probs[0, idx].item()
+                    penalty_str = f" (was {original_prob:.4f})" if idx in recent_usage else ""
+                    print(f"        {i+1}. {self.registry.metadata[idx]['name']}: {prob:.4f}{penalty_str}")
+                
+                print(f"      Top-3 Secondary (after exploration bonus):")
+                top_secondary = torch.topk(secondary_probs_adjusted[0], min(3, vocab_size))
+                for i in range(len(top_secondary.indices)):
+                    idx = top_secondary.indices[i].item()
+                    prob = top_secondary.values[i].item()
+                    original_prob = secondary_probs[0, idx].item()
+                    penalty_str = f" (was {original_prob:.4f})" if idx in recent_usage else ""
+                    print(f"        {i+1}. {self.registry.metadata[idx]['name']}: {prob:.4f}{penalty_str}")
+                
+                print(f"      Composition probabilities:")
+                comp_types = ['none', 'sequential', 'nested', 'parallel']
+                for comp_type, prob in zip(comp_types, comp_probs[0]):
+                    print(f"        {comp_type}: {prob.item():.4f}")
+                
+                # Generate candidates with layer-based prioritization
+                top_k = min(vocab_size, 5)
+                
+                primary_top = torch.topk(primary_probs_adjusted[0], top_k)
+                secondary_top = torch.topk(secondary_probs_adjusted[0], top_k)
                 comp_top = torch.topk(comp_probs[0], min(4, comp_probs.shape[-1]))
                 
+                # Generate 3-function candidates with parallel composition
                 for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
                     for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
-                        for c_idx, c_prob in zip(comp_top.indices, comp_top.values):
-                            comp_types = ['none', 'sequential', 'nested', 'parallel']
-                            comp_type = comp_types[c_idx.item()]
+                        # Try tertiary combiners for parallel composition
+                        for t_idx in range(vocab_size):
+                            t_prob = primary_probs_adjusted[0, t_idx]
                             
-                            score = (p_prob * s_prob * c_prob * outputs['confidence'][0]).item()
+                            # Layer-based bonus: prefer higher-layer functions for primary/secondary
+                            # but also allow primitives (like + in exp(sin(x)+cos(x)))
+                            p_layer = self.registry.metadata[p_idx.item()]['layer']
+                            s_layer = self.registry.metadata[s_idx.item()]['layer']
+                            t_layer = self.registry.metadata[t_idx]['layer']
+                            
+                            # Bonus for using mixed abstraction levels (not all same layer)
+                            diversity_bonus = 1.0
+                            if len(set([p_layer, s_layer, t_layer])) > 1:
+                                diversity_bonus = 1.2
+                            
+                            score = (p_prob * s_prob * t_prob * outputs['confidence'][0] * diversity_bonus).item()
                             
                             candidates.append({
                                 'primary_id': p_idx.item(),
                                 'secondary_id': s_idx.item(),
-                                'comp_type': comp_type,
+                                'tertiary_id': t_idx,
+                                'comp_type': 'parallel',
                                 'score': score,
                                 'step': step
                             })
+                        
+                        # Also try 2-function compositions
+                        for c_idx, c_prob in zip(comp_top.indices, comp_top.values):
+                            comp_types = ['none', 'sequential', 'nested', 'parallel']
+                            comp_type = comp_types[c_idx.item()]
+                            
+                            if comp_type != 'parallel':
+                                # Same diversity bonus
+                                p_layer = self.registry.metadata[p_idx.item()]['layer']
+                                s_layer = self.registry.metadata[s_idx.item()]['layer']
+                                
+                                diversity_bonus = 1.0
+                                if comp_type != 'none' and p_layer != s_layer:
+                                    diversity_bonus = 1.2
+                                
+                                score = (p_prob * s_prob * c_prob * outputs['confidence'][0] * diversity_bonus).item()
+                                
+                                candidates.append({
+                                    'primary_id': p_idx.item(),
+                                    'secondary_id': s_idx.item(),
+                                    'tertiary_id': None,
+                                    'comp_type': comp_type,
+                                    'score': score,
+                                    'step': step
+                                })
                 
-                # Early halt if confident
-                if outputs['confidence'][0] > 0.9:
+                if outputs['confidence'][0] > 0.8 or step >= 3:
+                    print(f"\n    [Halting] Confidence: {outputs['confidence'][0].item():.4f} (threshold: 0.8)")
                     break
         
         # Sort and validate
         candidates.sort(key=lambda x: x['score'], reverse=True)
         
-        for candidate in candidates[:15]:
-            if self.validate_program(
-                candidate['primary_id'],
-                candidate['secondary_id'],
-                candidate['comp_type'],
-                examples
-            ):
-                print(f"  [Success] Found via TRM at step {candidate['step']}")
-                print(f"    Primary: {self.registry.metadata[candidate['primary_id']]['name']}")
-                print(f"    Secondary: {self.registry.metadata[candidate['secondary_id']]['name']}")
-                print(f"    Composition: {candidate['comp_type']}")
-                return candidate
+        print(f"\n    [Validation] Testing top {min(len(candidates), 50)} candidates...")
+        print(f"      Top-5 candidates by score:")
+        for i, candidate in enumerate(candidates[:5]):
+            p_name = self.registry.metadata[candidate['primary_id']]['name']
+            s_name = self.registry.metadata[candidate['secondary_id']]['name']
+            t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
+            print(f"        {i+1}. {p_name} + {s_name} + {t_name} ({candidate['comp_type']}): {candidate['score']:.6f}")
         
-        print(f"  [Failed] No valid program found")
+        for i, candidate in enumerate(candidates[:50]):
+            p_name = self.registry.metadata[candidate['primary_id']]['name']
+            s_name = self.registry.metadata[candidate['secondary_id']]['name']
+            t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
+            
+            if i < 10:
+                print(f"\n      Testing Rank {i+1}: {p_name} + {s_name} + {t_name} ({candidate['comp_type']})")
+                print(f"        Executing on examples:")
+                all_match = True
+                for inp, expected in examples:
+                    try:
+                        result = self.execute_program(
+                            candidate['primary_id'],
+                            candidate['secondary_id'],
+                            candidate['comp_type'],
+                            inp,
+                            candidate.get('tertiary_id')
+                        )
+                        match = result == expected
+                        all_match = all_match and match
+                        status = "✓" if match else "✗"
+                        print(f"          {status} f{tuple(inp)} = {result} (expected {expected})")
+                    except Exception as e:
+                        print(f"          ✗ f{tuple(inp)} = ERROR: {str(e)[:50]}")
+                        all_match = False
+                
+                if all_match:
+                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/50)")
+                    print(f"    Primary: {p_name}")
+                    print(f"    Secondary: {s_name}")
+                    if candidate.get('tertiary_id') is not None:
+                        print(f"    Tertiary: {t_name}")
+                    print(f"    Composition: {candidate['comp_type']}")
+                    print(f"    Score: {candidate['score']:.6f}")
+                    return candidate
+            else:
+                if self.validate_program(
+                    candidate['primary_id'],
+                    candidate['secondary_id'],
+                    candidate['comp_type'],
+                    examples,
+                    candidate.get('tertiary_id')
+                ):
+                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/50)")
+                    print(f"    Primary: {p_name}")
+                    print(f"    Secondary: {s_name}")
+                    if candidate.get('tertiary_id') is not None:
+                        print(f"    Tertiary: {t_name}")
+                    print(f"    Composition: {candidate['comp_type']}")
+                    print(f"    Score: {candidate['score']:.6f}")
+                    return candidate
+        
+        print(f"\n  [Failed] No valid program found in top 50 candidates")
         return None
 
     def train_step(self, examples: List[Tuple[List[int], Any]], 
@@ -567,12 +827,19 @@ class SymbolicAgent:
         if program is None:
             return False
         
-        # Train
-        print(f"\n  [Training] Refining weights...")
-        for epoch in range(num_epochs):
-            loss = self.train_step(examples, program)
-            if epoch % 10 == 0:
-                print(f"    Epoch {epoch}: Loss = {loss:.4f}")
+        # Train (skip for exhaustive finds, focus on refining TRM predictions)
+        if program['step'] > 0:
+            print(f"\n  [Training] Refining TRM search...")
+            for epoch in range(num_epochs):
+                loss = self.train_step(examples, program)
+                if epoch % 10 == 0:
+                    print(f"    Epoch {epoch}: Loss = {loss:.4f}")
+        else:
+            print(f"\n  [Training] Found via exhaustive search, training TRM to predict it...")
+            for epoch in range(num_epochs):
+                loss = self.train_step(examples, program)
+                if epoch % 10 == 0:
+                    print(f"    Epoch {epoch}: Loss = {loss:.4f}")
         
         # Save
         def learned_function(*args):
@@ -580,7 +847,8 @@ class SymbolicAgent:
                 program['primary_id'],
                 program['secondary_id'],
                 program['comp_type'],
-                list(args)
+                list(args),
+                program.get('tertiary_id')
             )
         
         arity = len(examples[0][0])
@@ -614,25 +882,18 @@ def main():
     
     print(f"\nInitial: {[m['name'] for m in registry.metadata.values()]}")
     
-    # Learn NAND first (simpler)
-    print("\n" + "="*60)
-    print("Testing exhaustive search manually")
-    print("="*60)
+    # ==========================================
+    # Step 0: Pre-train on curriculum
+    # ==========================================
+    agent.train_on_curriculum(num_epochs=20)
+    
+    # ==========================================
+    # Layer 1: Learn NAND
+    # ==========================================
     nand_examples = [([0, 0], 1), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)]
-    
-    # Test all compositions
-    for p_id in range(registry.get_vocab_size()):
-        for s_id in range(registry.get_vocab_size()):
-            for comp in ['none', 'sequential', 'nested']:
-                if agent.validate_program(p_id, s_id, comp, nand_examples):
-                    print(f"Found NAND: primary={registry.metadata[p_id]['name']}, "
-                          f"secondary={registry.metadata[s_id]['name']}, comp={comp}")
-    
-    # Now learn NAND
     success = agent.learn_abstraction("NAND", nand_examples, num_epochs=30)
     
     if success:
-        # Test NAND
         print("\n" + "="*60)
         print("Testing NAND")
         print("="*60)
@@ -641,10 +902,33 @@ def main():
             result = registry.execute_function(nand_id, inputs)
             print(f"  {'✓' if result == expected else '✗'} NAND{tuple(inputs)} = {result}")
     
-    # XOR requires more complex composition - skip for now
+    # ==========================================
+    # Layer 2: Learn XOR (using NAND)
+    # ==========================================
+    xor_examples = [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)]
+    
+    success = agent.learn_abstraction("XOR", xor_examples, num_epochs=30)
+    
+    if success:
+        print("\n" + "="*60)
+        print("Testing XOR")
+        print("="*60)
+        xor_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'XOR')
+        for inputs, expected in xor_examples:
+            result = registry.execute_function(xor_id, inputs)
+            print(f"  {'✓' if result == expected else '✗'} XOR{tuple(inputs)} = {result}")
+    
+    # ==========================================
+    # Summary
+    # ==========================================
     print("\n" + "="*60)
-    print("Note: XOR requires 3+ function composition")
-    print("XOR = (A OR B) AND NOT(A AND B)")
+    print("Final Function Registry")
+    print("="*60)
+    for fid, meta in registry.metadata.items():
+        print(f"  [{fid}] {meta['name']} (arity={meta['arity']}, layer={meta['layer']})")
+    
+    print("\n" + "="*60)
+    print("Abstraction Hierarchy Learned!")
     print("="*60)
 
 if __name__ == "__main__":
