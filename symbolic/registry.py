@@ -73,17 +73,43 @@ class SymbolicRegistry:
                 # Build child inputs by mapping indices to available values
                 child_inputs = []
                 for idx in arg_indices:
-                    if idx < len(available_values):
+                    # Negative indices encode literal function IDs
+                    if idx < 0:
+                        # Decode: idx = -func_id-1, so func_id = -idx-1
+                        func_id = -idx - 1
+                        child_inputs.append(func_id)
+                    elif idx < len(available_values):
                         child_inputs.append(available_values[idx])
                     else:
                         raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
                 
-                # Ensure we have the right number of arguments
-                if len(child_inputs) != child_arity:
-                    raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                # Special handling for LOOP (arity=-1)
+                if child_id == self.loop_id and child_meta['name'] == 'LOOP':
+                    if len(child_inputs) != 3:
+                        raise ValueError(f"LOOP expects 3 args: (func_id, start, count), got {len(child_inputs)}")
+                    
+                    # child_inputs = [func_id, start_value, count]
+                    loop_func_id = child_inputs[0]
+                    start_value = child_inputs[1]
+                    count = child_inputs[2]
+                    
+                    # Apply the function 'count' times
+                    result = start_value
+                    for _ in range(count):
+                        result = self.execute_function(loop_func_id, [result])
                 
-                # Execute the child function
-                result = self.execute_function(child_id, child_inputs)
+                # Normal function execution
+                elif child_arity != -1:
+                    # Ensure we have the right number of arguments
+                    if len(child_inputs) != child_arity:
+                        raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                    
+                    # Execute the child function
+                    result = self.execute_function(child_id, child_inputs)
+                
+                else:
+                    # Variable arity function (not LOOP) - just pass all args
+                    result = self.execute_function(child_id, child_inputs)
                 
                 # Add result to available values for next function
                 available_values.append(result)
@@ -185,17 +211,43 @@ class SymbolicRegistry:
                 # Build child inputs by mapping indices to available values
                 child_inputs = []
                 for idx in arg_indices:
-                    if idx < len(available_values):
+                    # Negative indices encode literal function IDs
+                    if idx < 0:
+                        # Decode: idx = -func_id-1, so func_id = -idx-1
+                        func_id = -idx - 1
+                        child_inputs.append(func_id)
+                    elif idx < len(available_values):
                         child_inputs.append(available_values[idx])
                     else:
                         raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
                 
-                # Ensure we have the right number of arguments
-                if len(child_inputs) != child_arity:
-                    raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                # Special handling for LOOP (arity=-1)
+                if child_id == self.loop_id and child_meta['name'] == 'LOOP':
+                    if len(child_inputs) != 3:
+                        raise ValueError(f"LOOP expects 3 args: (func_id, start, count), got {len(child_inputs)}")
+                    
+                    # child_inputs = [func_id, start_value, count]
+                    loop_func_id = child_inputs[0]
+                    start_value = child_inputs[1]
+                    count = child_inputs[2]
+                    
+                    # Apply the function 'count' times
+                    result = start_value
+                    for _ in range(count):
+                        result = self.execute_function(loop_func_id, [result])
                 
-                # Execute the child function
-                result = self.execute_function(child_id, child_inputs)
+                # Normal function execution
+                elif child_arity != -1:
+                    # Ensure we have the right number of arguments
+                    if len(child_inputs) != child_arity:
+                        raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                    
+                    # Execute the child function
+                    result = self.execute_function(child_id, child_inputs)
+                
+                else:
+                    # Variable arity function (not LOOP) - just pass all args
+                    result = self.execute_function(child_id, child_inputs)
                 
                 # Add result to available values for next function
                 available_values.append(result)
@@ -207,7 +259,12 @@ class SymbolicRegistry:
         self.compositions[fid] = {'terms': composition}
 
     def get_vocab_size(self) -> int:
-        return self._next_id
+        """Get vocabulary size from database (actual number of registered functions)."""
+        cursor = self.db.conn.execute("SELECT COUNT(*) FROM functions")
+        count = cursor.fetchone()[0]
+        # Ensure _next_id is at least count (for new registrations)
+        self._next_id = max(self._next_id, count)
+        return count
 
     def execute_function(self, func_id: int, inputs: List[Any]) -> Any:
         """Execute a function by ID with given inputs."""

@@ -9,8 +9,8 @@ def main():
     print("="*60)
     
     # Check if checkpoints exist
-    if not os.path.exists("checkpoints/model.pt"):
-        print("\n[Error] No saved model found!")
+    if not os.path.exists("checkpoints/symbolic.db"):
+        print("\n[Error] No saved registry found!")
         print("Please run curriculum_training_main.py first to train the foundation.")
         return
     
@@ -20,8 +20,16 @@ def main():
     print("="*60)
     
     registry = SymbolicRegistry()
+    # Load registry from database instead of pickle
+    registry.load("checkpoints/symbolic.db")
+    
     agent = SymbolicAgent(registry, d_model=128, max_recursion=8, input_dim=32, max_composition_depth=3)
-    agent.load("checkpoints/model.pt", "checkpoints/registry.pkl")
+    
+    # Check if model checkpoint exists
+    if os.path.exists("checkpoints/model.pt"):
+        agent.load_checkpoint("checkpoints/model.pt")
+    else:
+        print("\n[Warning] No model checkpoint found, starting fresh")
     
     print(f"\nLoaded functions: {[m['name'] for m in registry.metadata.values()]}")
     
@@ -107,9 +115,7 @@ def main():
     print("\n" + "="*60)
     print("Final Function Registry")
     print("="*60)
-    for fid, meta in registry.metadata.items():
-        arity_str = f"arity={meta['arity']}" if meta['arity'] != -1 else "higher-order"
-        print(f"  [{fid}] {meta['name']} ({arity_str}, layer={meta['layer']})")
+    registry.db.print_summary()
 
 if __name__ == "__main__":
     main()

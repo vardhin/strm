@@ -79,8 +79,8 @@ class SymbolicAgent:
         print("\n  [Curriculum] Pre-training complete!\n")
 
     def learn_abstraction(self, name: str, examples: List[Tuple[List[int], int]], 
-                         num_epochs: int = 30, exploration_bonus: float = 0.5,
-                         max_terms: int = 2) -> bool:
+                     num_epochs: int = 30, exploration_bonus: float = 0.5,
+                     max_terms: int = 2) -> bool:
         """Learn a new abstraction from examples."""
         print(f"\n{'='*60}")
         print(f"Learning: {name}")
@@ -103,13 +103,11 @@ class SymbolicAgent:
         
         # Phase 2: SIMPLIFY the composition
         original_composition = self._build_composition_from_candidate(candidate, examples)
+        print(f"  [Debug] Original composition: {original_composition}")
         simplified_composition = self.simplifier.simplify(original_composition, examples)
+        print(f"  [Debug] Simplified composition: {simplified_composition}")
         
-        # Phase 3: Train on the ORIGINAL candidate (not simplified)
-        # because the model learned to predict this specific composition
-        self._train_on_composition(candidate, examples, num_epochs=num_epochs)
-        
-        # Phase 4: Register the SIMPLIFIED composition directly
+        # Phase 3: Register the SIMPLIFIED composition FIRST
         # This is what gets saved to the database and used for execution
         input_arity = len(examples[0][0])
         func_id = self.registry.register_composition(name, input_arity, simplified_composition)
@@ -117,8 +115,13 @@ class SymbolicAgent:
         print(f"\n  [Memory] Saved '{name}' as Function ID {func_id}")
         print(f"    Final composition: {[(self.registry.metadata[cid]['name'], args) for cid, args in simplified_composition]}")
         
-        # Expand model vocabulary
+        # Phase 4: Expand model vocabulary BEFORE training
         self.resize_model_for_new_abstraction()
+        
+        # Phase 5: Train on the ORIGINAL candidate (not simplified)
+        # because the model learned to predict this specific composition
+        # NOW with the fresh optimizer that matches the resized model
+        self._train_on_composition(candidate, examples, num_epochs=num_epochs)
         
         return True
 
@@ -135,14 +138,22 @@ class SymbolicAgent:
             primary_meta = self.registry.metadata[candidate['primary_id']]
             secondary_meta = self.registry.metadata[candidate['secondary_id']]
             
-            # Use arity to determine correct order
-            if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
+            # Special handling for LOOP with dynamic count
+            loop_count = candidate.get('loop_count', 1)
+            if secondary_meta['name'] == 'LOOP' and loop_count == -1:
+                # For LOOP with dynamic count, encode function ID as negative
+                # Use -func_id-1 to encode the function ID
+                # This distinguishes it from valid argument indices (which are >= 0)
+                encoded_func_id = -candidate['primary_id'] - 1
+                composition.append((candidate['secondary_id'], [encoded_func_id, 0, 1]))
+            # Use arity to determine correct order for normal sequential
+            elif primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
                 composition.append((candidate['primary_id'], list(range(input_arity))))
                 composition.append((candidate['secondary_id'], [input_arity]))
             else:
                 composition.append((candidate['secondary_id'], list(range(input_arity))))
                 composition.append((candidate['primary_id'], [input_arity]))
-        
+    
         elif comp_type == 'nested':
             # primary(secondary(x), secondary(y))
             composition.append((candidate['secondary_id'], [0]))
@@ -253,6 +264,9 @@ class SymbolicAgent:
         
         tried_candidates = set()
         
+        # Get valid vocab size from registry
+        valid_vocab_size = self.registry.get_vocab_size()
+        
         for step in range(max_steps):
             print(f"\n  [TRM Search] Step {step+1}/{max_steps}...")
             
@@ -270,6 +284,11 @@ class SymbolicAgent:
                 secondary_logits = output['secondary_logits'].mean(dim=0)
                 tertiary_logits = output['tertiary_logits'].mean(dim=0)
                 composition_logits = output['composition_logits'].mean(dim=0)
+            
+            # Mask out invalid function IDs (beyond vocab size) for ALL heads
+            primary_logits = primary_logits[:valid_vocab_size]
+            secondary_logits = secondary_logits[:valid_vocab_size]
+            tertiary_logits = tertiary_logits[:valid_vocab_size]
             
             top_k = min(3 + step, len(primary_logits))
             comp_types = ['none', 'sequential', 'nested', 'parallel']
@@ -497,12 +516,8 @@ class SymbolicAgent:
         
         return batch_data
 
-    def resize_model_for_new_abstraction(self):
-        """Dynamically resize output heads when new function is learned."""
-        new_vocab_size = self.registry.get_vocab_size()
-        self.config['max_functions'] = new_vocab_size
-        
-        # Resize all function prediction heads
+    def _resize_model_heads(self, old_vocab_size: int, new_vocab_size: int):
+        """Resize model heads to accommodate new vocabulary."""
         heads_to_resize = ['head_primary_op', 'head_secondary_op', 'head_tertiary_op']
         
         for head_name in heads_to_resize:
@@ -510,7 +525,6 @@ class SymbolicAgent:
                 continue
                 
             old_head = getattr(self.model, head_name)
-            old_vocab_size = old_head.weight.shape[0]
             
             if old_vocab_size >= new_vocab_size:
                 continue  # Already big enough
@@ -527,6 +541,44 @@ class SymbolicAgent:
                 ) * 0.01
             
             setattr(self.model, head_name, new_head)
+
+    def resize_model_for_new_abstraction(self):
+        """Dynamically resize output heads when new function is learned."""
+        new_vocab_size = self.registry.get_vocab_size()
+        old_vocab_size = self.config['max_functions']
+        
+        if old_vocab_size >= new_vocab_size:
+            return  # Already big enough
+        
+        print(f"  [Resize] Expanding vocabulary from {old_vocab_size} to {new_vocab_size}")
+        
+        self.config['max_functions'] = new_vocab_size
+        
+        # CRITICAL: Get learning rate BEFORE any changes
+        old_lr = self.optimizer.param_groups[0]['lr']
+        
+        # Resize model heads AFTER saving LR but BEFORE touching optimizer
+        self._resize_model_heads(old_vocab_size, new_vocab_size)
+        
+        # Delete trainer FIRST (it holds reference to optimizer)
+        if hasattr(self, 'trainer'):
+            del self.trainer
+        
+        # Delete optimizer
+        del self.optimizer
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Create COMPLETELY fresh optimizer with resized parameters
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=old_lr)
+        
+        # Create trainer with the fresh optimizer
+        self.trainer = TRMTrainer(
+            self.model, self.optimizer, self.config, self.registry
+        )
         
         print(f"  [Resize] Model vocabulary expanded to {new_vocab_size} functions")
 
@@ -543,19 +595,74 @@ class SymbolicAgent:
         print(f"  [Agent] Model saved to {path}")
         print(f"  [Registry] Saved to {registry_path}")
 
-    def load(self, path: str = "checkpoints/model.pt", registry_path: str = "checkpoints/registry.pkl"):
-        """Load model and registry."""
-        self.registry.load(registry_path)
+    def load_checkpoint(self, path: str = "checkpoints/model.pt"):
+        """Load model checkpoint."""
+        if not os.path.exists(path):
+            print(f"  [Warning] Checkpoint not found: {path}")
+            return
         
-        checkpoint = torch.load(path, weights_only=False)
-        self.config = checkpoint['config']
-        self.training_history = checkpoint.get('training_history', [])
+        checkpoint = torch.load(path)
         
-        # Reinitialize model with loaded config
-        self.model = SymbolicTRMCore(self.config)
-        self.model.load_state_dict(checkpoint['model_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        # Get the old vocab size from checkpoint
+        old_vocab_size = checkpoint['config']['max_functions']
+        current_vocab_size = self.registry.get_vocab_size()
+        
+        # CRITICAL: If vocab sizes differ, we need to handle this carefully
+        if old_vocab_size != current_vocab_size:
+            print(f"  [Warning] Vocab size mismatch: checkpoint has {old_vocab_size}, registry has {current_vocab_size}")
+            print(f"  [Resize] Expanding model to match registry...")
+            
+            # STEP 1: Temporarily reconfigure to OLD vocab size
+            old_config = self.config.copy()
+            old_config['max_functions'] = old_vocab_size
+            
+            # STEP 2: Create a temporary model with OLD vocab size
+            temp_model = SymbolicTRMCore(old_config)
+            
+            # STEP 3: Load checkpoint into temp model (sizes match!)
+            temp_model.load_state_dict(checkpoint['model_state'], strict=False)
+            
+            # STEP 4: Update config to NEW vocab size
+            self.config['max_functions'] = current_vocab_size
+            
+            # STEP 5: Resize the temp model's heads from OLD to NEW
+            self.model = temp_model  # Swap in the loaded model
+            self._resize_model_heads(old_vocab_size, current_vocab_size)
+        
+        else:
+            # Sizes match - just load normally
+            self.model.load_state_dict(checkpoint['model_state'], strict=False)
+            self.config['max_functions'] = current_vocab_size
+    
+        # Get learning rate from checkpoint
+        old_lr = checkpoint['optimizer_state']['param_groups'][0]['lr']
+        
+        # CRITICAL: Clean up old optimizer/trainer completely
+        if hasattr(self, 'trainer'):
+            del self.trainer
+        if hasattr(self, 'optimizer'):
+            del self.optimizer
+        
+        import gc
+        gc.collect()
+        
+        # Create brand new optimizer
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=old_lr)
+        
+        # Load optimizer state ONLY if sizes match
+        if old_vocab_size == current_vocab_size:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+                print(f"  [Optimizer] Loaded optimizer state (vocab size {current_vocab_size})")
+            except Exception as e:
+                print(f"  [Warning] Could not load optimizer state: {e}")
+        else:
+            print(f"  [Optimizer] Fresh optimizer (vocab changed: {old_vocab_size} → {current_vocab_size})")
+    
+        # NOW create trainer with the fully configured optimizer
+        self.trainer = TRMTrainer(
+            self.model, self.optimizer, self.config, self.registry
+        )
         
         print(f"  [Agent] Model loaded from {path}")
-        print(f"  [Agent] Vocabulary size: {self.registry.get_vocab_size()}")
-        print(f"  [Agent] Training history: {len(self.training_history)} episodes")
+        print(f"  [Agent] Vocabulary size: {current_vocab_size}")
