@@ -13,14 +13,18 @@ class ProgramSearcher:
         self.model = model
         self.config = config
         self.training_history = training_history
+        # Maximum number of functions that can be composed
+        self.max_composition_depth = config.get('max_composition_depth', 3)
     
     def exhaustive_search(self, examples: List[Tuple[List[int], Any]]) -> Optional[Dict]:
-        """Exhaustive search with 3-function compositions."""
+        """Exhaustive search with configurable composition depth."""
         vocab_size = self.registry.get_vocab_size()
         loop_id = self.registry.loop_id
         input_arity = len(examples[0][0])
         
-        # Try single operations
+        print(f"  [Bootstrap] Using exhaustive search (vocab size = {vocab_size}, max depth = {self.max_composition_depth})")
+        
+        # Try single operations (depth 1)
         for primary_id in range(vocab_size):
             if primary_id == loop_id:
                 continue
@@ -40,7 +44,10 @@ class ProgramSearcher:
                     'loop_count': 1
                 }
         
-        # Try 2-function compositions
+        if self.max_composition_depth < 2:
+            return None
+        
+        # Try 2-function compositions (depth 2)
         for primary_id in range(vocab_size):
             if primary_id == loop_id:
                 continue
@@ -79,14 +86,27 @@ class ProgramSearcher:
                             'loop_count': 1
                         }
         
-        # Try 3-function parallel composition (only for binary inputs)
+        if self.max_composition_depth < 3:
+            return None
+        
+        # Try 3-function parallel composition (depth 3, only for binary inputs)
+        # This is needed for XOR: (A OR B) AND NOT(A AND B)
+        # which is: primary=OR, secondary=AND, tertiary=NOT, comp_type=parallel
         if input_arity >= 2:
             for primary_id in range(vocab_size):
                 if primary_id == loop_id:
                     continue
+                func_arity = self.registry.metadata[primary_id]['arity']
+                if func_arity > 1 and input_arity < func_arity:
+                    continue
+                    
                 for secondary_id in range(vocab_size):
                     if secondary_id == loop_id:
                         continue
+                    func_arity = self.registry.metadata[secondary_id]['arity']
+                    if func_arity > 1 and input_arity < func_arity:
+                        continue
+                        
                     for tertiary_id in range(vocab_size):
                         if tertiary_id == loop_id:
                             continue
@@ -107,7 +127,7 @@ class ProgramSearcher:
                    task_name: str, x_input: torch.Tensor, carry,
                    exploration_bonus: float = 0.5) -> Optional[Dict]:
         """TRM-based learned search with exploration."""
-        print(f"  [TRM Search] Using learned heuristics (vocab size = {self.registry.get_vocab_size()})...")
+        print(f"  [TRM Search] Using learned heuristics (vocab size = {self.registry.get_vocab_size()}, max depth = {self.max_composition_depth})...")
         
         self.model.eval()
         candidates = []
@@ -153,7 +173,7 @@ class ProgramSearcher:
                                             secondary_probs_adjusted, comp_probs, 
                                             primary_probs, secondary_probs, recent_usage)
                 
-                # Generate candidates (with input arity filtering)
+                # Generate candidates (with input arity filtering and depth limit)
                 candidates.extend(self._generate_candidates(
                     primary_probs_adjusted, secondary_probs_adjusted, comp_probs, outputs, step, input_arity
                 ))
@@ -184,7 +204,7 @@ class ProgramSearcher:
     def _generate_candidates(self, primary_probs, secondary_probs, comp_probs, outputs, step, input_arity=2):
         """Generate candidate programs from model predictions."""
         candidates = []
-        seen_programs = set()  # Add deduplication
+        seen_programs = set()  # Track unique programs
         
         vocab_size = self.registry.get_vocab_size()
         top_k = min(vocab_size, 5)
@@ -210,12 +230,11 @@ class ProgramSearcher:
                 return True
             return False
         
-        # For parallel composition: only generate if we have binary inputs
-        if input_arity >= 2:
+        # For 3-function parallel composition: only if depth >= 3 and binary inputs
+        if self.max_composition_depth >= 3 and input_arity >= 2:
             for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
                 # LOOP cannot be primary
                 if p_idx.item() == loop_id:
-                    print(f"      [Debug] Skipping LOOP as primary (prob={p_prob:.4f})")
                     continue
                 if not is_compatible(p_idx.item(), input_arity):
                     continue
@@ -240,87 +259,83 @@ class ProgramSearcher:
                         diversity_bonus = 1.5 if len(set([p_layer, s_layer, t_layer])) > 1 else 1.0
                         score = (p_prob * s_prob * t_prob * outputs['confidence'][0] * diversity_bonus).item()
                         
-                        candidates.append({
-                            'primary_id': p_idx.item(),
-                            'secondary_id': s_idx.item(),
-                            'tertiary_id': t_idx,
-                            'comp_type': 'parallel',
-                            'score': score,
-                            'step': step,
-                            'loop_count': 1
-                        })
-        
-        # 2-function compositions (all arities)
-        for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
-            # LOOP cannot be primary function
-            if p_idx.item() == loop_id:
-                continue
-                
-            # Primary must be compatible with input arity
-            if not is_compatible(p_idx.item(), input_arity):
-                continue
-                
-            for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
-                for c_idx, c_prob in zip(comp_top.indices, comp_top.values):
-                    comp_types = ['none', 'sequential', 'nested', 'parallel']
-                    comp_type = comp_types[c_idx.item()]
-                    
-                    # Skip parallel for unary inputs
-                    if comp_type == 'parallel' and input_arity == 1:
-                        continue
-                    
-                    # LOOP only valid in sequential composition (and only as secondary)
-                    if comp_type == 'parallel' and s_idx.item() == loop_id:
-                        continue
-                    if comp_type == 'nested' and s_idx.item() == loop_id:
-                        continue
-                    if comp_type == 'none' and s_idx.item() == loop_id:
-                        continue
-                    
-                    if comp_type != 'parallel':
-                        p_layer = self.registry.metadata[p_idx.item()]['layer']
-                        s_layer = self.registry.metadata[s_idx.item()]['layer']
-                        
-                        diversity_bonus = 1.5 if (comp_type != 'none' and p_layer != s_layer) else 1.0
-                        score = (p_prob * s_prob * c_prob * outputs['confidence'][0] * diversity_bonus).item()
-                        
-                        # If secondary is LOOP, try different loop counts
-                        if s_idx.item() == loop_id and comp_type == 'sequential':
-                            for loop_count in [2, 3, 1, 4, 5]:  # Prioritize 2 and 3
-                                candidates.append({
-                                    'primary_id': p_idx.item(),
-                                    'secondary_id': s_idx.item(),
-                                    'tertiary_id': None,
-                                    'comp_type': comp_type,
-                                    'score': score * (1.5 if loop_count == 2 else 1.0) / loop_count,  # Bonus for loop_count=2
-                                    'step': step,
-                                    'loop_count': loop_count
-                                })
-                        else:
+                        # Create unique key
+                        program_key = (p_idx.item(), s_idx.item(), t_idx, 'parallel', 1)
+                        if program_key not in seen_programs:
+                            seen_programs.add(program_key)
                             candidates.append({
                                 'primary_id': p_idx.item(),
                                 'secondary_id': s_idx.item(),
-                                'tertiary_id': None,
-                                'comp_type': comp_type,
+                                'tertiary_id': t_idx,
+                                'comp_type': 'parallel',
                                 'score': score,
                                 'step': step,
                                 'loop_count': 1
                             })
         
-        # Deduplicate candidates
-        for candidate in candidates:
-            # Create unique key for program
-            program_key = (
-                candidate['primary_id'],
-                candidate['secondary_id'],
-                candidate.get('tertiary_id'),
-                candidate['comp_type'],
-                candidate.get('loop_count', 1)
-            )
-            
-            if program_key not in seen_programs:
-                seen_programs.add(program_key)
-                candidates.append(candidate)
+        # 2-function compositions (if depth >= 2)
+        if self.max_composition_depth >= 2:
+            for p_idx, p_prob in zip(primary_top.indices, primary_top.values):
+                # LOOP cannot be primary function
+                if p_idx.item() == loop_id:
+                    continue
+                    
+                # Primary must be compatible with input arity
+                if not is_compatible(p_idx.item(), input_arity):
+                    continue
+                    
+                for s_idx, s_prob in zip(secondary_top.indices, secondary_top.values):
+                    for c_idx, c_prob in zip(comp_top.indices, comp_top.values):
+                        comp_types = ['none', 'sequential', 'nested', 'parallel']
+                        comp_type = comp_types[c_idx.item()]
+                        
+                        # Skip parallel for unary inputs
+                        if comp_type == 'parallel' and input_arity == 1:
+                            continue
+                        
+                        # LOOP only valid in sequential composition (and only as secondary)
+                        if comp_type == 'parallel' and s_idx.item() == loop_id:
+                            continue
+                        if comp_type == 'nested' and s_idx.item() == loop_id:
+                            continue
+                        if comp_type == 'none' and s_idx.item() == loop_id:
+                            continue
+                        
+                        if comp_type != 'parallel':
+                            p_layer = self.registry.metadata[p_idx.item()]['layer']
+                            s_layer = self.registry.metadata[s_idx.item()]['layer']
+                            
+                            diversity_bonus = 1.5 if (comp_type != 'none' and p_layer != s_layer) else 1.0
+                            score = (p_prob * s_prob * c_prob * outputs['confidence'][0] * diversity_bonus).item()
+                            
+                            # If secondary is LOOP, try different loop counts
+                            if s_idx.item() == loop_id and comp_type == 'sequential':
+                                for loop_count in [2, 3, 1, 4, 5]:  # Prioritize 2 and 3
+                                    program_key = (p_idx.item(), s_idx.item(), None, comp_type, loop_count)
+                                    if program_key not in seen_programs:
+                                        seen_programs.add(program_key)
+                                        candidates.append({
+                                            'primary_id': p_idx.item(),
+                                            'secondary_id': s_idx.item(),
+                                            'tertiary_id': None,
+                                            'comp_type': comp_type,
+                                            'score': score * (1.5 if loop_count == 2 else 1.0) / loop_count,
+                                            'step': step,
+                                            'loop_count': loop_count
+                                        })
+                            else:
+                                program_key = (p_idx.item(), s_idx.item(), None, comp_type, 1)
+                                if program_key not in seen_programs:
+                                    seen_programs.add(program_key)
+                                    candidates.append({
+                                        'primary_id': p_idx.item(),
+                                        'secondary_id': s_idx.item(),
+                                        'tertiary_id': None,
+                                        'comp_type': comp_type,
+                                        'score': score,
+                                        'step': step,
+                                        'loop_count': 1
+                                    })
         
         return candidates
     
@@ -407,17 +422,18 @@ class ProgramSearcher:
         print(f"    Composition: {candidate['comp_type']}")
         print(f"    Score: {candidate['score']:.6f}")
     
-    def _print_search_context(self, layer_functions, recent_usage, exploration_bonus):
-        """Print search context."""
-        print(f"    Available functions by layer:")
+    def _print_search_context(self, layer_functions: Dict, recent_usage: Dict, exploration_bonus: float):
+        """Print search context including layers and usage penalties."""
+        print("    Available functions by layer:")
         for layer in sorted(layer_functions.keys(), reverse=True):
-            func_names = [self.registry.metadata[fid]['name'] for fid in layer_functions[layer]]
-            print(f"      Layer {layer}: {func_names}")
+            names = [self.registry.metadata[fid]['name'] for fid in layer_functions[layer]]
+            print(f"      Layer {layer}: {names}")
         
         if recent_usage:
-            print(f"    Recent usage penalties (decay-weighted):")
-            for fid, count in sorted(recent_usage.items(), key=lambda x: x[1], reverse=True)[:3]:
-                print(f"      {self.registry.metadata[fid]['name']}: -{exploration_bonus * count:.3f}")
+            print("    Recent usage penalties (decay-weighted):")
+            for fid, count in sorted(recent_usage.items(), key=lambda x: x[1], reverse=True):
+                if fid is not None and fid in self.registry.metadata:  # Skip None and invalid IDs
+                    print(f"      {self.registry.metadata[fid]['name']}: -{exploration_bonus * count:.3f}")
     
     def _print_step_predictions(self, step, outputs, primary_probs_adjusted, 
                                secondary_probs_adjusted, comp_probs, 

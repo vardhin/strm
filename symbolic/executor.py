@@ -142,3 +142,36 @@ class ProgramExecutor:
             except (IndexError, TypeError, KeyError, Exception):
                 return False
         return True
+    
+    def execute_parallel(self, primary_id: int, secondary_id: int, tertiary_id: int, inputs: List[int]) -> int:
+        """Execute parallel composition: tertiary(primary(inputs), secondary(inputs))
+        
+        This allows building functions like XOR:
+        XOR(a,b) = AND(OR(a,b), NOT(AND(a,b)))
+        Which is: primary=OR, secondary=AND, tertiary=NOT, combiner would be AND
+        
+        But we need a 4th function to combine! Let's use tertiary as the combiner instead:
+        XOR(a,b) = combiner(f1(a,b), f2(a,b))
+        Where f1 and f2 are applied to inputs, then combined.
+        
+        For XOR: AND(OR(a,b), NOT(AND(a,b)))
+        - primary = OR -> OR(a,b)
+        - secondary = sequential(AND, NOT) -> NOT(AND(a,b))
+        - tertiary = AND (combiner) -> AND(result1, result2)
+        
+        So parallel means: tertiary(primary(inputs), secondary(inputs))
+        """
+        if not self._is_arity_compatible(primary_id, len(inputs)):
+            raise ValueError(f"Primary function arity incompatible with {len(inputs)} inputs")
+        if not self._is_arity_compatible(secondary_id, len(inputs)):
+            raise ValueError(f"Secondary function arity incompatible with {len(inputs)} inputs")
+        
+        # Apply primary and secondary to inputs
+        result1 = self.registry.execute_function(primary_id, inputs)
+        result2 = self.registry.execute_function(secondary_id, inputs)
+        
+        # Combine results with tertiary function
+        if not self._is_arity_compatible(tertiary_id, 2):
+            raise ValueError(f"Tertiary function must accept 2 inputs, got arity {self.registry.metadata[tertiary_id]['arity']}")
+        
+        return self.registry.execute_function(tertiary_id, [result1, result2])

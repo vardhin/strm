@@ -9,7 +9,9 @@ from .training import TRMTrainer
 class SymbolicAgent:
     """Main orchestrator for symbolic reasoning with TRM."""
     
-    def __init__(self, registry: SymbolicRegistry, d_model=128, max_recursion=10, input_dim=32):
+    def __init__(self, registry: SymbolicRegistry, d_model: int = 128, 
+                 max_recursion: int = 8, input_dim: int = 32, max_composition_depth: int = 3):
+        """Initialize agent with TRM model."""
         self.registry = registry
         self.executor = ProgramExecutor(registry)
         self.curriculum_gen = CurriculumGenerator(registry, input_dim=input_dim)  # Pass input_dim!
@@ -32,6 +34,7 @@ class SymbolicAgent:
             'L_cycles': 2,
             'L_layers': 2,
             'halt_max_steps': max_recursion,
+            'max_composition_depth': max_composition_depth,  # NEW: control composition depth
         }
         
         self.model = SymbolicTRMCore(self.config)
