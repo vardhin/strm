@@ -366,21 +366,88 @@ class SymbolicAgent:
 
     def _register_abstraction(self, name: str, comp_data: Dict, examples: List) -> int:
         """Register new abstraction in registry."""
-        def learned_fn(inputs):
-            return self.executor.execute_program(
-                comp_data['primary_id'],
-                comp_data['secondary_id'],
-                comp_data['comp_type'],
-                inputs,
-                tertiary_id=comp_data.get('tertiary_id'),
-                loop_count=comp_data.get('loop_count', 1)
-            )
+        # Build composition list from comp_data
+        composition = []
         
+        # Get input arity from examples
         input_arity = len(examples[0][0])
-        fid = self.registry.register(name, learned_fn, arity=input_arity)
+        comp_type = comp_data['comp_type']
+        
+        if comp_type == 'none':
+            # Just a single function
+            composition.append((comp_data['primary_id'], list(range(input_arity))))
+        
+        elif comp_type == 'sequential':
+            # secondary(primary(x, y)) - chain them
+            # PRIMARY is the INNER function, SECONDARY is the OUTER function
+            # So we need to check which one should go first based on arity
+            
+            primary_meta = self.registry.metadata[comp_data['primary_id']]
+            secondary_meta = self.registry.metadata[comp_data['secondary_id']]
+            
+            # If primary arity matches inputs, it's the inner function
+            if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
+                # Normal order: primary(inputs), then secondary(result)
+                composition.append((comp_data['primary_id'], list(range(input_arity))))
+                composition.append((comp_data['secondary_id'], [input_arity]))
+            else:
+                # Swapped: secondary should be inner, primary is outer
+                # This happens when search finds them in reverse order
+                composition.append((comp_data['secondary_id'], list(range(input_arity))))
+                composition.append((comp_data['primary_id'], [input_arity]))
+        
+        elif comp_type == 'nested':
+            # primary(secondary(x), secondary(y))
+            # First compute secondary(x) - result at index input_arity
+            composition.append((comp_data['secondary_id'], [0]))
+            # Then compute secondary(y) - result at index input_arity + 1
+            composition.append((comp_data['secondary_id'], [1]))
+            # Finally apply primary to both results
+            composition.append((comp_data['primary_id'], [input_arity, input_arity + 1]))
+        
+        elif comp_type == 'parallel':
+            # tertiary(primary(x,y), secondary(x,y))
+            # First compute primary
+            composition.append((comp_data['primary_id'], list(range(input_arity))))
+            # Then compute secondary
+            composition.append((comp_data['secondary_id'], list(range(input_arity))))
+            # Finally combine with tertiary (results are at indices input_arity and input_arity+1)
+            if comp_data.get('tertiary_id') is not None:
+                composition.append((comp_data['tertiary_id'], [input_arity, input_arity + 1]))
+            # If no tertiary but it's marked parallel, treat as sequential
+            elif comp_data['secondary_id'] is not None:
+                # This is actually a sequential composition misclassified as parallel
+                # Apply the arity-based ordering logic
+                primary_meta = self.registry.metadata[comp_data['primary_id']]
+                secondary_meta = self.registry.metadata[comp_data['secondary_id']]
+                
+                if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
+                    composition = [
+                        (comp_data['primary_id'], list(range(input_arity))),
+                        (comp_data['secondary_id'], [input_arity])
+                    ]
+                else:
+                    composition = [
+                        (comp_data['secondary_id'], list(range(input_arity))),
+                        (comp_data['primary_id'], [input_arity])
+                    ]
+        
+        else:
+            raise ValueError(f"Unknown composition type: {comp_type}")
+        
+        # Use register_composition instead of register
+        fid = self.registry.register_composition(name, input_arity, composition)
         
         print(f"\n  [Memory] Saved '{name}' as Function ID {fid}")
+        print(f"    Composition: {[(self.registry.metadata[cid]['name'], args) for cid, args in composition]}")
         return fid
+
+    def _register_discovered_function(self, name: str, arity: int, composition: List[Tuple[int, List[int]]]):
+        """Register a newly discovered function composition."""
+        # Use register_composition instead of register
+        func_id = self.registry.register_composition(name, arity, composition)
+        print(f"  [Agent] Registered {name} as function #{func_id}")
+        return func_id
 
     def format_examples(self, examples: List[Tuple[List[int], Any]]) -> torch.Tensor:
         """Format examples into tensor for TRM input."""

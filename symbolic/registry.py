@@ -1,9 +1,9 @@
 import json
-import pickle
 from typing import Dict, List, Tuple, Any, Optional, Callable
+from symbolic_db import SymbolicDB
 
 class SymbolicRegistry:
-    """Registry for symbolic functions with save/load capabilities."""
+    """Registry for symbolic functions with SQLite database storage."""
     
     def __init__(self):
         self.functions: Dict[int, Callable] = {}
@@ -12,54 +12,143 @@ class SymbolicRegistry:
         self.loop_id = None
         self._next_id = 0
         
-        # Initialize with primitives
+        # Initialize DB first
+        self.db = SymbolicDB()
+        
+        # Then initialize primitives (which will register to DB)
         self._initialize_primitives()
     
-    def save(self, filepath: str):
-        """Save registry to disk."""
-        data = {
-            'metadata': self.metadata,
-            'compositions': self.compositions,
-            'loop_id': self.loop_id,
-            'next_id': self._next_id
+    def _initialize_primitives(self):
+        """Register minimal primitive set for Turing completeness."""
+        # Bitwise operations (for bit manipulation)
+        or_id = self.register("OR", lambda inputs: inputs[0] | inputs[1], arity=2)
+        and_id = self.register("AND", lambda inputs: inputs[0] & inputs[1], arity=2)
+        not_id = self.register("NOT", lambda inputs: ~inputs[0], arity=1)
+        
+        # Arithmetic primitives (successor and predecessor)
+        inc_id = self.register("INC", lambda inputs: inputs[0] + 1, arity=1)
+        dec_id = self.register("DEC", lambda inputs: inputs[0] - 1, arity=1)
+        
+        # Meta-function for iteration (higher-order)
+        self.loop_id = self.register("LOOP", None, arity=-1)
+        
+        # Register all primitives to DB
+        for fid in [or_id, and_id, not_id, inc_id, dec_id, self.loop_id]:
+            meta = self.metadata[fid]
+            self.db.add_primitive(fid, meta['name'], meta['arity'])
+
+    def register(self, name: str, func: Callable, arity: int, is_primitive: bool = True) -> int:
+        """Register a new function (primitive or learned)."""
+        fid = self._next_id
+        self.functions[fid] = func
+        self.metadata[fid] = {"name": name, "arity": arity, "layer": 0}  # layer will be set by DB
+        self._next_id += 1
+        
+        return fid
+
+    def register_composition(self, name: str, arity: int, composition: List[Tuple[int, List[int]]]) -> int:
+        """Register a learned abstraction and save to DB.
+        
+        Args:
+            name: Function name
+            arity: Number of arguments
+            composition: List of (child_func_id, arg_indices) tuples
+        
+        Returns:
+            New function ID
+        """
+        func_id = self._next_id
+        
+        # Create executable function from composition
+        def composed_fn(inputs, comp=composition):
+            # Start with original inputs as a list
+            available_values = list(inputs) if isinstance(inputs, list) else [inputs]
+            
+            # Execute each function in the composition
+            for child_id, arg_indices in comp:
+                # Get the child function's metadata
+                child_meta = self.metadata[child_id]
+                child_arity = child_meta['arity']
+                
+                # Build child inputs by mapping indices to available values
+                child_inputs = []
+                for idx in arg_indices:
+                    if idx < len(available_values):
+                        child_inputs.append(available_values[idx])
+                    else:
+                        raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
+                
+                # Ensure we have the right number of arguments
+                if len(child_inputs) != child_arity:
+                    raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                
+                # Execute the child function
+                result = self.execute_function(child_id, child_inputs)
+                
+                # Add result to available values for next function
+                available_values.append(result)
+            
+            # Return the last computed value
+            return available_values[-1]
+        
+        self.functions[func_id] = composed_fn
+        self.metadata[func_id] = {"name": name, "arity": arity, "layer": -1}  # will be set by DB
+        self.compositions[func_id] = {
+            'terms': composition
         }
+        self._next_id += 1
         
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
+        # Save to database - this calculates layer automatically AND commits
+        self.db.add_abstraction(func_id, name, arity, composition)
         
-        print(f"  [Registry] Saved to {filepath}")
+        # Update layer in metadata from DB
+        db_func = self.db.get_function(func_id)
+        if db_func:
+            self.metadata[func_id]['layer'] = db_func['layer']
+        
+        return func_id
+
+    def save(self, path: str = "checkpoints/registry.pkl"):
+        """Save registry - now just prints DB summary."""
+        print(f"  [Registry] All data saved to database: {self.db.db_path}")
+        self.db.print_summary()
     
-    def load(self, filepath: str):
-        """Load registry from disk."""
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
+    def load(self, db_path: str = "checkpoints/symbolic.db"):
+        """Load registry from database."""
+        self.db = SymbolicDB(db_path)
         
         # Clear existing data
         self.functions = {}
         self.metadata = {}
         self.compositions = {}
+        self._next_id = 0
         
-        # Restore metadata and compositions
-        self.metadata = data['metadata']
-        self.compositions = data['compositions']
-        self.loop_id = data['loop_id']
-        self._next_id = data['next_id']
+        # Rebuild from database
+        all_funcs = self.db.get_all_functions()
         
-        # First pass: rebuild all primitive functions
-        for fid in sorted(self.metadata.keys()):
-            if fid not in self.compositions:
-                # This is a primitive function
+        for func_data in all_funcs:
+            fid = func_data['id']
+            name = func_data['name']
+            arity = func_data['arity']
+            layer = func_data['layer']
+            
+            self.metadata[fid] = {
+                'name': name,
+                'arity': arity,
+                'layer': layer
+            }
+            
+            # Check if primitive by layer
+            if layer == 0:
                 self._rebuild_primitive(fid)
+            else:
+                composition = self.db.get_composition(fid)
+                self._rebuild_composition(fid, composition)
+            
+            self._next_id = max(self._next_id, fid + 1)
         
-        # Second pass: rebuild all composed functions
-        # (must be done after primitives are available)
-        for fid in sorted(self.compositions.keys()):
-            comp_data = self.compositions[fid]
-            self._rebuild_composition(fid, comp_data)
-        
-        print(f"  [Registry] Loaded from {filepath}")
-        print(f"  [Registry] Vocabulary size: {len(self.metadata)}")
-        print(f"  [Registry] Functions: {[m['name'] for m in self.metadata.values()]}")
+        print(f"  [Registry] Loaded {len(all_funcs)} functions from {db_path}")
+        self.db.print_summary()
     
     def _rebuild_primitive(self, fid: int):
         """Rebuild a primitive function."""
@@ -76,117 +165,54 @@ class SymbolicRegistry:
         elif name == 'DEC':
             self.functions[fid] = lambda inputs: inputs[0] - 1
         elif name == 'LOOP':
-            # LOOP is special - it's a higher-order function handled elsewhere
-            pass
+            self.loop_id = fid
+            # LOOP is special - handled by agent
         else:
             raise ValueError(f"Unknown primitive function: {name}")
     
-    def _rebuild_composition(self, fid: int, comp_data: Dict):
-        """Rebuild a composed function from saved data."""
-        comp_type = comp_data['composition']
-        primary_id = comp_data['primary_id']
-        secondary_id = comp_data['secondary_id']
-        tertiary_id = comp_data.get('tertiary_id')
-        loop_count = comp_data.get('loop_count', 1)
-        
-        if comp_type == 'sequential':
-            if secondary_id == self.loop_id:
-                # Rebuild LOOP composition
-                def loop_fn(inputs, p=primary_id, lc=loop_count):
-                    result = inputs[0] if len(inputs) == 1 else inputs
-                    for _ in range(lc):
-                        result = self.execute_function(p, [result] if not isinstance(result, list) else result)
-                    return result
-                self.functions[fid] = loop_fn
-            else:
-                # Rebuild sequential composition: f2(f1(inputs))
-                def seq_fn(inputs, p=primary_id, s=secondary_id):
-                    intermediate = self.execute_function(p, inputs)
-                    return self.execute_function(s, [intermediate])
-                self.functions[fid] = seq_fn
-        
-        elif comp_type == 'nested':
-            # Rebuild nested composition: f1(f2(x) for each x in inputs)
-            # But check if secondary expects multiple inputs
-            secondary_arity = self.metadata[secondary_id]['arity']
+    def _rebuild_composition(self, fid: int, composition: List[Tuple[int, List[int]]]):
+        """Rebuild a composed function from DB data."""
+        def composed_fn(inputs, comp=composition):
+            # Start with original inputs as a list
+            available_values = list(inputs) if isinstance(inputs, list) else [inputs]
             
-            if secondary_arity == 1:
-                # Apply secondary to each element individually
-                def nested_fn(inputs, p=primary_id, s=secondary_id):
-                    transformed = [self.execute_function(s, [x]) for x in inputs]
-                    return self.execute_function(p, transformed)
-                self.functions[fid] = nested_fn
-            else:
-                # Secondary needs multiple inputs - just pass inputs through
-                def nested_fn(inputs, p=primary_id, s=secondary_id):
-                    transformed = self.execute_function(s, inputs)
-                    return self.execute_function(p, [transformed])
-                self.functions[fid] = nested_fn
+            # Execute each function in the composition
+            for child_id, arg_indices in comp:
+                # Get the child function's metadata
+                child_meta = self.metadata[child_id]
+                child_arity = child_meta['arity']
+                
+                # Build child inputs by mapping indices to available values
+                child_inputs = []
+                for idx in arg_indices:
+                    if idx < len(available_values):
+                        child_inputs.append(available_values[idx])
+                    else:
+                        raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
+                
+                # Ensure we have the right number of arguments
+                if len(child_inputs) != child_arity:
+                    raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                
+                # Execute the child function
+                result = self.execute_function(child_id, child_inputs)
+                
+                # Add result to available values for next function
+                available_values.append(result)
+            
+            # Return the last computed value
+            return available_values[-1]
         
-        elif comp_type == 'parallel':
-            # Rebuild parallel composition: tertiary(primary(inputs), secondary(inputs))
-            def parallel_fn(inputs, p=primary_id, s=secondary_id, t=tertiary_id):
-                result1 = self.execute_function(p, inputs)
-                result2 = self.execute_function(s, inputs)
-                return self.execute_function(t, [result1, result2])
-            self.functions[fid] = parallel_fn
-
-    def _create_loop_function(self, primary_id: int, loop_count: int):
-        """Create a loop function closure."""
-        def loop_fn(inputs):
-            result = inputs[0] if len(inputs) == 1 else inputs
-            for _ in range(loop_count):
-                result = self.execute_function(primary_id, [result] if not isinstance(result, list) else result)
-            return result
-        return loop_fn
-
-    def _initialize_primitives(self):
-        """Register minimal primitive set for Turing completeness."""
-        # Bitwise operations (for bit manipulation)
-        self.register("OR", lambda inputs: inputs[0] | inputs[1], arity=2)
-        self.register("AND", lambda inputs: inputs[0] & inputs[1], arity=2)
-        self.register("NOT", lambda inputs: ~inputs[0], arity=1)
-        
-        # Arithmetic primitives (successor and predecessor)
-        self.register("INC", lambda inputs: inputs[0] + 1, arity=1)
-        self.register("DEC", lambda inputs: inputs[0] - 1, arity=1)
-        
-        # Meta-function for iteration (higher-order)
-        self.loop_id = self.register("LOOP", None, arity=-1)
-
-    def register(self, name: str, func: Callable, arity: int, layer: int = -1) -> int:
-        """Saves a new function to the registry."""
-        fid = self._next_id
-        self.functions[fid] = func
-        if layer == -1:
-            layer = self._compute_layer(func)
-        self.metadata[fid] = {"name": name, "arity": arity, "layer": layer}
-        self._next_id += 1
-        return fid
-
-    def _compute_layer(self, func: Callable) -> int:
-        """Compute abstraction layer based on function composition."""
-        if not self.metadata:
-            return 0
-        return max(m['layer'] for m in self.metadata.values()) + 1
+        self.functions[fid] = composed_fn
+        self.compositions[fid] = {'terms': composition}
 
     def get_vocab_size(self) -> int:
         return self._next_id
 
     def execute_function(self, func_id: int, inputs: List[Any]) -> Any:
-        """Execute a function by ID with given inputs.
-        
-        Args:
-            func_id: ID of function to execute
-            inputs: List of input values
-            
-        Returns:
-            Result of function execution
-        """
+        """Execute a function by ID with given inputs."""
         if func_id not in self.functions:
             raise ValueError(f"Function {func_id} not found in registry")
         
         func = self.functions[func_id]
-        
-        # All functions now expect inputs as a list
         return func(inputs)
