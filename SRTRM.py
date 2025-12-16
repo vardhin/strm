@@ -328,19 +328,42 @@ class SymbolicAgent:
         print(f"  [Resize] Model vocabulary expanded to {new_vocab_size} functions")
 
     def format_examples(self, examples: List[Tuple[List[int], Any]]) -> torch.Tensor:
-        """Convert I/O examples to model input format."""
+        """
+        Convert I/O examples to structured format with explicit I/O separation.
+        Shape: [batch, num_examples, 3] where each row is [input1, input2, output]
+        This lets the model attend to output patterns (e.g., XOR=[0,1,1,0] vs NAND=[1,1,1,0])
+        
+        For unary functions, we pad the second input with 0.
+        """
         data = []
         for inputs, output in examples:
-            data.extend(inputs)
-            if isinstance(output, tuple):
-                data.extend(output)
+            # Pad unary inputs to binary (2 inputs)
+            if len(inputs) == 1:
+                padded_inputs = inputs + [0]  # NOT(x) -> [x, 0]
             else:
-                data.append(output)
+                padded_inputs = inputs[:2]  # Take first 2 for binary ops
+            
+            # Each example is a row: [input1, input2, output]
+            data.append(padded_inputs + [output])
         
-        # Pad or truncate
-        if len(data) < self.config['input_dim']:
-            data.extend([0] * (self.config['input_dim'] - len(data)))
-        data = data[:self.config['input_dim']]
+        # Pad to fixed size (4 examples)
+        while len(data) < self.config['seq_len']:
+            data.append([0, 0, 0])
+        
+        # Flatten for model input: [batch, seq_len * 3]
+        flat_data = [val for row in data for val in row]
+        return torch.tensor([flat_data], dtype=torch.float32)
+
+    def format_examples_with_attention(self, examples):
+        """Encode examples with explicit I/O separation."""
+        # Shape: [batch, num_examples, 3] where 3 = [input1, input2, output]
+        data = []
+        for inputs, output in examples:
+            data.append(inputs + [output])
+        
+        # Pad to fixed size
+        while len(data) < self.config['seq_len']:
+            data.append([0, 0, 0])
         
         return torch.tensor([data], dtype=torch.float32)
 
@@ -489,51 +512,50 @@ class SymbolicAgent:
             {'primary_id': 1, 'secondary_id': 0, 'tertiary_id': None, 'comp_type': 'none', 'step': 0}
         ))
         
+        tasks.append((
+            "NOT_identity",
+            [([0], 1), ([1], 0)],  # Unary function examples
+            {'primary_id': 2, 'secondary_id': 0, 'tertiary_id': None, 'comp_type': 'none', 'step': 0}
+        ))
+        
         # Task 2: Teach sequential composition (builds on primitives)
         tasks.append((
-            "NOT_OR",  # NOT(OR(x,y))
+            "NOT_OR",  # NOT(OR(x,y)) = NOR
             [([0, 0], 1), ([0, 1], 0), ([1, 0], 0), ([1, 1], 0)],
             {'primary_id': 0, 'secondary_id': 2, 'tertiary_id': None, 'comp_type': 'sequential', 'step': 0}
         ))
         
         tasks.append((
-            "NOT_AND",  # NOT(AND(x,y)) - this will become NAND
+            "NOT_AND",  # NOT(AND(x,y)) = NAND
             [([0, 0], 1), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0)],
             {'primary_id': 1, 'secondary_id': 2, 'tertiary_id': None, 'comp_type': 'sequential', 'step': 0}
         ))
         
+        # Task 3: Teach parallel composition MORE EXPLICITLY
+        # Use a simpler example: AND(OR(x,y), AND(x,y)) = AND (identity check)
+        tasks.append((
+            "parallel_identity",  # AND(OR(x,y), AND(x,y))
+            [([0, 0], 0), ([0, 1], 0), ([1, 0], 0), ([1, 1], 1)],
+            {'primary_id': 0, 'secondary_id': 1, 'tertiary_id': 1, 'comp_type': 'parallel', 'step': 0}
+        ))
+        
+        # Task 4: OR as combiner (critical for XOR!)
+        # OR(AND(x,y), AND(x,y)) - another identity to teach OR combiner
+        tasks.append((
+            "parallel_or_combiner",
+            [([0, 0], 0), ([0, 1], 0), ([1, 0], 0), ([1, 1], 1)],
+            {'primary_id': 1, 'secondary_id': 1, 'tertiary_id': 0, 'comp_type': 'parallel', 'step': 0}
+        ))
+        
         return tasks
-
-    def train_on_curriculum(self, num_epochs: int = 20):
-        """Pre-train TRM on synthetic curriculum tasks."""
-        print("\n" + "="*60)
-        print("Training on Curriculum Tasks")
-        print("="*60)
-        
-        tasks = self.generate_curriculum_tasks()
-        
-        for task_name, examples, target_program in tasks:
-            print(f"\n  [Curriculum] Learning: {task_name}")
-            print(f"    Target: {self.registry.metadata[target_program['primary_id']]['name']}", end="")
-            if target_program['comp_type'] != 'none':
-                print(f" + {self.registry.metadata[target_program['secondary_id']]['name']} ({target_program['comp_type']})")
-            else:
-                print()
-            
-            for epoch in range(num_epochs):
-                loss = self.train_step(examples, target_program)
-                if epoch % 10 == 0:
-                    print(f"      Epoch {epoch}: Loss = {loss:.4f}")
-        
-        print("\n  [Curriculum] Pre-training complete!")
 
     def search_with_recursive_trm(self, examples: List[Tuple[List[int], Any]], 
                                   task_name: str = "Unknown",
-                                  exploration_bonus: float = 0.1) -> Optional[Dict]:
+                                  exploration_bonus: float = 0.5) -> Optional[Dict]:  # Increase from 0.3
         """
         Use TRM's recursive reasoning with:
         1. Learned heuristics
-        2. Exploration bonuses (penalize recent predictions)
+        2. STRONGER exploration bonuses (penalize recent predictions)
         3. Top-down layer prioritization
         """
         print(f"\n--- Searching for: {task_name} ---")
@@ -569,14 +591,16 @@ class SymbolicAgent:
                 layer_functions[layer] = []
             layer_functions[layer].append(fid)
         
-        # Penalize recently used functions (exploration bonus)
+        # Penalize recently used functions MORE AGRESSIVELY
         recent_usage = {}
-        for history_item in self.training_history[-3:]:  # Last 3 tasks
+        for i, history_item in enumerate(self.training_history[-5:]):  # Look at last 5 tasks (was 3)
             prog = history_item['program']
-            recent_usage[prog['primary_id']] = recent_usage.get(prog['primary_id'], 0) + 1
-            recent_usage[prog['secondary_id']] = recent_usage.get(prog['secondary_id'], 0) + 1
+            # Decay penalty: most recent gets highest penalty
+            decay = (len(self.training_history[-5:]) - i) / len(self.training_history[-5:])
+            recent_usage[prog['primary_id']] = recent_usage.get(prog['primary_id'], 0) + decay
+            recent_usage[prog['secondary_id']] = recent_usage.get(prog['secondary_id'], 0) + decay
             if prog.get('tertiary_id') is not None:
-                recent_usage[prog['tertiary_id']] = recent_usage.get(prog['tertiary_id'], 0) + 1
+                recent_usage[prog['tertiary_id']] = recent_usage.get(prog['tertiary_id'], 0) + decay
         
         print(f"    Available functions by layer:")
         for layer in sorted(layer_functions.keys(), reverse=True):  # Show top-down
@@ -584,7 +608,7 @@ class SymbolicAgent:
             print(f"      Layer {layer}: {func_names}")
         
         if recent_usage:
-            print(f"    Recent usage penalties:")
+            print(f"    Recent usage penalties (decay-weighted):")
             for fid, count in sorted(recent_usage.items(), key=lambda x: x[1], reverse=True)[:3]:
                 print(f"      {self.registry.metadata[fid]['name']}: -{exploration_bonus * count:.3f}")
         
@@ -596,12 +620,14 @@ class SymbolicAgent:
                 secondary_probs = F.softmax(outputs['secondary_logits'], dim=-1)
                 comp_probs = F.softmax(outputs['composition_logits'], dim=-1)
                 
-                # Apply exploration bonus (penalize recent predictions)
+                # Apply STRONGER exploration bonus (penalize recent predictions)
                 primary_probs_adjusted = primary_probs.clone()
                 secondary_probs_adjusted = secondary_probs.clone()
                 
                 for fid, count in recent_usage.items():
                     penalty = exploration_bonus * count
+                    # Cap penalty at 0.9 to avoid complete suppression
+                    penalty = min(penalty, 0.9)
                     primary_probs_adjusted[0, fid] *= (1 - penalty)
                     secondary_probs_adjusted[0, fid] *= (1 - penalty)
                 
@@ -657,10 +683,10 @@ class SymbolicAgent:
                             s_layer = self.registry.metadata[s_idx.item()]['layer']
                             t_layer = self.registry.metadata[t_idx]['layer']
                             
-                            # Bonus for using mixed abstraction levels (not all same layer)
+                            # STRONGER diversity bonus for mixing abstraction levels
                             diversity_bonus = 1.0
                             if len(set([p_layer, s_layer, t_layer])) > 1:
-                                diversity_bonus = 1.2
+                                diversity_bonus = 1.5  # Was 1.2, increase to 1.5
                             
                             score = (p_prob * s_prob * t_prob * outputs['confidence'][0] * diversity_bonus).item()
                             
@@ -685,7 +711,7 @@ class SymbolicAgent:
                                 
                                 diversity_bonus = 1.0
                                 if comp_type != 'none' and p_layer != s_layer:
-                                    diversity_bonus = 1.2
+                                    diversity_bonus = 1.5  # Was 1.2
                                 
                                 score = (p_prob * s_prob * c_prob * outputs['confidence'][0] * diversity_bonus).item()
                                 
@@ -698,14 +724,14 @@ class SymbolicAgent:
                                     'step': step
                                 })
                 
-                if outputs['confidence'][0] > 0.8 or step >= 3:
-                    print(f"\n    [Halting] Confidence: {outputs['confidence'][0].item():.4f} (threshold: 0.8)")
+                if outputs['confidence'][0] > 0.8 or step >= 5:  # Increase max steps from 3 to 5
+                    print(f"\n    [Halting] Confidence: {outputs['confidence'][0].item():.4f} (threshold: 0.8, step: {step+1}/5)")
                     break
         
         # Sort and validate
         candidates.sort(key=lambda x: x['score'], reverse=True)
         
-        print(f"\n    [Validation] Testing top {min(len(candidates), 50)} candidates...")
+        print(f"\n    [Validation] Testing top {min(len(candidates), 100)} candidates...")  # Increase from 50 to 100
         print(f"      Top-5 candidates by score:")
         for i, candidate in enumerate(candidates[:5]):
             p_name = self.registry.metadata[candidate['primary_id']]['name']
@@ -713,7 +739,7 @@ class SymbolicAgent:
             t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
             print(f"        {i+1}. {p_name} + {s_name} + {t_name} ({candidate['comp_type']}): {candidate['score']:.6f}")
         
-        for i, candidate in enumerate(candidates[:50]):
+        for i, candidate in enumerate(candidates[:100]):  # Test top 100 instead of 50
             p_name = self.registry.metadata[candidate['primary_id']]['name']
             s_name = self.registry.metadata[candidate['secondary_id']]['name']
             t_name = self.registry.metadata[candidate['tertiary_id']]['name'] if candidate.get('tertiary_id') else 'N/A'
@@ -740,7 +766,7 @@ class SymbolicAgent:
                         all_match = False
                 
                 if all_match:
-                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/50)")
+                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/100)")
                     print(f"    Primary: {p_name}")
                     print(f"    Secondary: {s_name}")
                     if candidate.get('tertiary_id') is not None:
@@ -756,7 +782,7 @@ class SymbolicAgent:
                     examples,
                     candidate.get('tertiary_id')
                 ):
-                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/50)")
+                    print(f"\n  [Success] Found via TRM at step {candidate['step']} (rank {i+1}/100)")
                     print(f"    Primary: {p_name}")
                     print(f"    Secondary: {s_name}")
                     if candidate.get('tertiary_id') is not None:
@@ -765,7 +791,7 @@ class SymbolicAgent:
                     print(f"    Score: {candidate['score']:.6f}")
                     return candidate
         
-        print(f"\n  [Failed] No valid program found in top 50 candidates")
+        print(f"\n  [Failed] No valid program found in top 100 candidates")
         return None
 
     def train_step(self, examples: List[Tuple[List[int], Any]], 
@@ -867,6 +893,45 @@ class SymbolicAgent:
         })
         
         return True
+
+    def train_on_curriculum(self, num_epochs: int = 20):
+        """Pre-train on curriculum tasks to teach compositional patterns."""
+        print("\n" + "="*60)
+        print("Training on Curriculum Tasks")
+        print("="*60)
+        
+        tasks = self.generate_curriculum_tasks()
+        
+        for task_name, examples, target_program in tasks:
+            print(f"\n  [Curriculum] Learning: {task_name}")
+            
+            # Print what we're teaching
+            p_name = self.registry.metadata[target_program['primary_id']]['name']
+            if target_program['comp_type'] == 'none':
+                print(f"    Target: {p_name}")
+            elif target_program['comp_type'] == 'parallel' and target_program.get('tertiary_id') is not None:
+                s_name = self.registry.metadata[target_program['secondary_id']]['name']
+                t_name = self.registry.metadata[target_program['tertiary_id']]['name']
+                print(f"    Target: {p_name} + {s_name} ({target_program['comp_type']} with {t_name} combiner)")
+            else:
+                s_name = self.registry.metadata[target_program['secondary_id']]['name']
+                print(f"    Target: {p_name} + {s_name} ({target_program['comp_type']})")
+            
+            # Train on this task
+            for epoch in range(num_epochs):
+                loss = self.train_step(examples, target_program)
+                if epoch % 10 == 0:
+                    print(f"      Epoch {epoch}: Loss = {loss:.4f}")
+            
+            # Store in history for exploration bonus
+            self.training_history.append({
+                'name': task_name,
+                'id': None,  # Curriculum tasks don't create new functions
+                'program': target_program,
+                'examples': examples
+            })
+        
+        print(f"\n  [Curriculum] Pre-training complete!")
 
 # ==========================================
 # 4. Main Execution
