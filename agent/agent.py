@@ -134,6 +134,15 @@ class SymbolicAgent:
         input_arity = len(examples[0][0])
         comp_type = candidate['comp_type']
         
+        # Special handling for LOOP_DIRECT
+        if comp_type == 'loop_direct':
+            loop_id = candidate['primary_id']
+            body_fn_id = candidate['secondary_id']
+            # For SUB(a, b): LOOP(DEC, count=b, init=a)
+            # Composition: [(LOOP, [DEC, param1, param0])]
+            composition.append((loop_id, [body_fn_id, 1, 0]))
+            return composition
+        
         if comp_type == 'none':
             composition.append((candidate['primary_id'], list(range(input_arity))))
         
@@ -377,11 +386,15 @@ class SymbolicAgent:
                         prim_id = prim_idx if isinstance(prim_idx, int) else prim_idx.item()
                         sec_id = sec_idx if isinstance(sec_idx, int) else sec_idx.item()
                         
+                        # CRITICAL FIX: Handle LOOP specially
+                        # LOOP needs to be used directly with 'none' composition type
+                        # because it takes [body_fn_id, count, init] as arguments
+                        if prim_id == self.registry.loop_id or sec_id == self.registry.loop_id:
+                            # Skip LOOP in sequential/nested/parallel - it needs 'none' type
+                            # We'll handle it separately below
+                            continue
+                        
                         loop_count = 1
-                        if sec_id == self.registry.loop_id:
-                            prim_meta = self.registry.metadata.get(prim_id)
-                            if prim_meta and prim_meta.get('arity') in [1, 2]:
-                                loop_count = -1
                         
                         # For parallel composition, try with combiners
                         if comp_type == 'parallel':
@@ -402,6 +415,27 @@ class SymbolicAgent:
                                 'comp_type': comp_type,
                                 'loop_count': loop_count
                             })
+            
+            # SPECIAL: Generate LOOP candidates separately
+            # LOOP(body_fn, count, init) needs comp_type='none' with special structure
+            if self.registry.loop_id is not None:
+                # Try LOOP with each primitive function as body
+                primitive_fns = [fid for fid, meta in self.registry.metadata.items() 
+                                if meta.get('layer', 0) == 0 and fid != self.registry.loop_id]
+                
+                for body_fn_id in primitive_fns:
+                    body_meta = self.registry.metadata.get(body_fn_id)
+                    if body_meta and body_meta.get('arity') == 1:  # LOOP works with unary functions
+                        # This will create: LOOP(body_fn, param1, param0)
+                        # Which means: apply body_fn param1 times to param0
+                        # For SUB: LOOP(DEC, b, a) = apply DEC b times to a
+                        candidates.append({
+                            'primary_id': self.registry.loop_id,
+                            'secondary_id': body_fn_id,  # Store body function here
+                            'tertiary_id': None,
+                            'comp_type': 'loop_direct',  # Special marker
+                            'loop_count': 1
+                        })
         
         # Depth 3+: Use learned functions ONLY if TRM suggests them
         if max_terms >= 3:
@@ -416,22 +450,21 @@ class SymbolicAgent:
                 if learned_in_primary or learned_in_secondary:
                     print(f"      TRM suggests {len(learned_in_primary)} learned fns in primary, {len(learned_in_secondary)} in secondary")
                     
-                    # ONLY try LOOP with learned functions if BOTH are predicted
-                    if self.registry.loop_id in secondary_top.tolist():
-                        for learned_id in learned_in_primary:
+                    # Try LOOP with learned functions
+                    if self.registry.loop_id is not None:
+                        for learned_id in learned_in_primary + learned_in_secondary:
                             learned_meta = self.registry.metadata[learned_id]
-                            if learned_meta.get('arity') == 2:
-                                # TRM predicted LOOP in secondary AND learned binary fn in primary
-                                # This is the pattern for MUL: LOOP(ADD, dynamic)
+                            if learned_meta.get('arity') in [1, 2]:
+                                # LOOP with learned function
                                 candidates.append({
-                                    'primary_id': learned_id,
-                                    'secondary_id': self.registry.loop_id,
+                                    'primary_id': self.registry.loop_id,
+                                    'secondary_id': learned_id,
                                     'tertiary_id': None,
-                                    'comp_type': 'sequential',
-                                    'loop_count': -1
+                                    'comp_type': 'loop_direct',
+                                    'loop_count': 1
                                 })
                     
-                    # Try compositions with learned functions if TRM suggests them
+                    # Try other compositions with learned functions
                     for comp_idx in comp_type_top:
                         comp_type = comp_types[comp_idx.item()]
                         if comp_type == 'none':
@@ -441,6 +474,8 @@ class SymbolicAgent:
                         if comp_type == 'parallel':
                             for learned_id in learned_in_primary:
                                 for prim_idx in primary_top:
+                                    if prim_idx.item() == self.registry.loop_id:
+                                        continue
                                     for tert_idx in tertiary_top:
                                         candidates.append({
                                             'primary_id': learned_id,
@@ -453,6 +488,8 @@ class SymbolicAgent:
                         # Sequential/nested: compose with learned functions
                         else:
                             for prim_idx in primary_top:
+                                if prim_idx.item() == self.registry.loop_id:
+                                    continue
                                 for learned_id in learned_in_secondary:
                                     candidates.append({
                                         'primary_id': prim_idx.item(),
@@ -485,6 +522,21 @@ class SymbolicAgent:
     def _test_composition(self, comp_data: Dict, examples: List[Tuple[List[int], int]]) -> bool:
         """Test if composition matches all examples."""
         try:
+            # Special handling for LOOP_DIRECT
+            if comp_data['comp_type'] == 'loop_direct':
+                loop_id = comp_data['primary_id']
+                body_fn_id = comp_data['secondary_id']
+                
+                for inputs, expected in examples:
+                    if len(inputs) != 2:
+                        return False
+                    # LOOP(body_fn, count=inputs[1], init=inputs[0])
+                    result = self.registry.execute_function(loop_id, [body_fn_id, inputs[1], inputs[0]])
+                    if result != expected:
+                        return False
+                return True
+            
+            # Normal composition testing
             for inputs, expected in examples:
                 result = self.executor.execute_program(
                     comp_data['primary_id'],

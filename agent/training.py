@@ -204,7 +204,13 @@ class TRMTrainer:
         secondary_target = comp_data.get('secondary_id')
         tertiary_target = comp_data.get('tertiary_id')
         
-        comp_type_map = {'none': 0, 'sequential': 1, 'nested': 2, 'parallel': 3}
+        comp_type_map = {
+            'none': 0,
+            'sequential': 1,
+            'nested': 2,
+            'parallel': 3,
+            'loop_direct': 0  # LOOP is treated as direct application
+        }
         comp_type_target = comp_type_map[comp_data['comp_type']]
         
         # Pool logits

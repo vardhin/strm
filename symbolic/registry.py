@@ -63,8 +63,29 @@ class SymbolicRegistry:
             available_values = list(inputs)
             
             for func_id, args in composition:
-                # Special handling for LOOP with encoded function ID
-                if func_id == self.loop_id and len(args) > 0 and args[0] < 0:
+                # Special handling for LOOP
+                if func_id == self.loop_id:
+                    # LOOP expects: [body_fn_id, count, init_value]
+                    # args = [body_fn_id, count_idx, init_idx]
+                    if len(args) != 3:
+                        raise ValueError(f"LOOP expects 3 args [fn_id, count_idx, init_idx], got {len(args)}")
+                    
+                    body_fn_id = args[0]  # This is a direct function ID
+                    count_idx = args[1]    # This is an index into available_values
+                    init_idx = args[2]     # This is an index into available_values
+                    
+                    if count_idx >= len(available_values) or init_idx >= len(available_values):
+                        raise ValueError(f"LOOP arg indices out of range: count_idx={count_idx}, init_idx={init_idx}, have {len(available_values)} values")
+                    
+                    count = available_values[count_idx]
+                    init_value = available_values[init_idx]
+                    
+                    # Execute LOOP
+                    result = self.execute_function(func_id, [body_fn_id, count, init_value])
+                    available_values.append(result)
+                
+                # Special handling for LOOP with encoded function ID (nested LOOP)
+                elif func_id == self.loop_id and len(args) > 0 and args[0] < 0:
                     # This is LOOP with a learned function
                     # args = [encoded_func_id, start_input_idx, count_input_idx]
                     from .executor import ProgramExecutor
@@ -79,6 +100,7 @@ class SymbolicRegistry:
                     # Execute loop with dynamic count (-1)
                     result = executor._execute_loop(loop_func_id, loop_inputs, loop_count=-1)
                     available_values.append(result)
+                
                 else:
                     # Normal composition step
                     step_inputs = []
@@ -184,7 +206,23 @@ class SymbolicRegistry:
             self.functions[fid] = lambda inputs: inputs[0] - 1
         elif name == 'LOOP':
             self.loop_id = fid
-            # LOOP is special - handled by agent
+            # LOOP implementation: applies a function repeatedly
+            # Expects: [func_id, count, init_value]
+            def loop_impl(inputs):
+                if len(inputs) != 3:
+                    raise ValueError(f"LOOP expects 3 args [func_id, count, init], got {len(inputs)}")
+                
+                func_id = inputs[0]
+                count = inputs[1]
+                init_value = inputs[2]
+                
+                result = init_value
+                for _ in range(count):
+                    result = self.execute_function(func_id, [result])
+                
+                return result
+            
+            self.functions[fid] = loop_impl
         else:
             raise ValueError(f"Unknown primitive function: {name}")
     
