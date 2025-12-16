@@ -8,51 +8,53 @@ class ProgramExecutor:
         self.registry = registry
     
     def execute_program(self, primary_id: int, secondary_id: Optional[int], 
-                       comp_type: str, inputs: List[int], 
-                       tertiary_id: Optional[int] = None,
-                       loop_count: int = 1) -> Any:
+                       comp_type: str, inputs: List[int],
+                       tertiary_id: Optional[int] = None, loop_count: int = 1) -> int:
         """Execute a composed program."""
         
         if comp_type == 'none':
-            return self.registry.execute_function(primary_id, inputs)
+            return self.registry.functions[primary_id](inputs)
         
-        if comp_type == 'sequential':
-            if secondary_id == self.registry.loop_id:
-                # LOOP: repeat primary function loop_count times
-                result = inputs[0] if len(inputs) == 1 else inputs
+        elif comp_type == 'sequential':
+            # f(g(inputs))
+            if secondary_id == self.registry.loop_id and loop_count == -1:
+                # Dynamic loop: apply f multiple times based on second input
+                result = inputs[0]
+                times = inputs[1]
+                for _ in range(times):
+                    result = self.registry.functions[primary_id]([result])
+                return result
+            elif secondary_id == self.registry.loop_id:
+                # Fixed loop
+                result = inputs[0]
                 for _ in range(loop_count):
-                    result = self.registry.execute_function(primary_id, [result] if not isinstance(result, list) else result)
+                    result = self.registry.functions[primary_id]([result])
                 return result
             else:
-                # Sequential: secondary(primary(inputs))
-                intermediate = self.registry.execute_function(primary_id, inputs)
-                return self.registry.execute_function(secondary_id, [intermediate])
+                # Regular sequential composition
+                intermediate = self.registry.functions[secondary_id](inputs)
+                return self.registry.functions[primary_id]([intermediate])
         
         elif comp_type == 'nested':
-            # Nested composition needs to check arity
-            secondary_meta = self.registry.metadata[secondary_id]
-            secondary_arity = secondary_meta['arity']
-            
-            if secondary_arity == 1:
-                # Apply secondary to each element: primary([secondary(x) for x in inputs])
-                transformed = [self.registry.execute_function(secondary_id, [x]) for x in inputs]
-                return self.registry.execute_function(primary_id, transformed)
-            elif secondary_arity == 2:
-                # If secondary needs 2 args but we have 2 inputs, just apply it directly
-                # This is a degenerate case: nested doesn't make sense here
-                # Fall back to just applying secondary to inputs
-                result = self.registry.execute_function(secondary_id, inputs)
-                return self.registry.execute_function(primary_id, [result])
-            else:
-                # For higher arity, apply secondary to all inputs
-                result = self.registry.execute_function(secondary_id, inputs)
-                return self.registry.execute_function(primary_id, [result])
+            # f(g(x), g(y), ...) - apply g to each input separately
+            transformed = [self.registry.functions[secondary_id]([inp]) for inp in inputs]
+            return self.registry.functions[primary_id](transformed)
         
         elif comp_type == 'parallel':
-            # Parallel: tertiary(primary(inputs), secondary(inputs))
-            result1 = self.registry.execute_function(primary_id, inputs)
-            result2 = self.registry.execute_function(secondary_id, inputs)
-            return self.registry.execute_function(tertiary_id, [result1, result2])
+            # NEW: combiner(f(inputs), g(inputs))
+            # Compute both functions on the same inputs, then combine
+            if tertiary_id is None:
+                # Default: just return first result (shouldn't happen)
+                result_f = self.registry.functions[primary_id](inputs)
+                result_g = self.registry.functions[secondary_id](inputs) if secondary_id else result_f
+                return result_f
+            else:
+                # Apply both functions, then combine with tertiary
+                result_f = self.registry.functions[primary_id](inputs)
+                result_g = self.registry.functions[secondary_id](inputs)
+                
+                # Combiner takes both results as inputs
+                return self.registry.functions[tertiary_id]([result_f, result_g])
         
         else:
             raise ValueError(f"Unknown composition type: {comp_type}")

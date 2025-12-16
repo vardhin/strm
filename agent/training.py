@@ -49,7 +49,7 @@ class TRMTrainer:
         x_input = format_fn(examples)
         batch_size = x_input.shape[0]
         
-        # Initialize carry
+        # Initialize carry - fresh each call
         carry = SymbolicTRMCarry(
             z_H=torch.zeros(batch_size, self.config['seq_len'], self.config['hidden_size']),
             z_L=torch.zeros(batch_size, self.config['seq_len'], self.config['hidden_size']),
@@ -64,20 +64,19 @@ class TRMTrainer:
             carry, outputs = self.model(carry, x_input)
             
             # Check shapes and pool if needed
-            # Expected: [batch_size, seq_len, vocab_size] -> pool to [batch_size, vocab_size]
-            # But model might output [batch_size, vocab_size] directly
             primary_logits = outputs['primary_logits']
             if primary_logits.dim() == 3:
                 # Has sequence dimension, pool it
                 primary_logits = primary_logits.mean(dim=1)
                 secondary_logits = outputs['secondary_logits'].mean(dim=1)
+                tertiary_logits = outputs['tertiary_logits'].mean(dim=1)
                 composition_logits = outputs['composition_logits'].mean(dim=1)
             elif primary_logits.dim() == 2:
                 # Already pooled
                 secondary_logits = outputs['secondary_logits']
+                tertiary_logits = outputs['tertiary_logits']
                 composition_logits = outputs['composition_logits']
             else:
-                # Unexpected shape, likely 1D - need to check what model returns
                 raise ValueError(
                     f"Unexpected logits shape: {primary_logits.shape}. "
                     f"Expected [batch_size, vocab_size] or [batch_size, seq_len, vocab_size]"
@@ -91,10 +90,15 @@ class TRMTrainer:
             # Create target tensors
             primary_target = torch.tensor([target_program['primary_id']] * batch_size, dtype=torch.long)
             
-            secondary_id = target_program['secondary_id']
+            secondary_id = target_program.get('secondary_id')
             if secondary_id is None:
                 secondary_id = target_program['primary_id']
             secondary_target = torch.tensor([secondary_id] * batch_size, dtype=torch.long)
+            
+            tertiary_id = target_program.get('tertiary_id')
+            if tertiary_id is None:
+                tertiary_id = 0  # Default to first function
+            tertiary_target = torch.tensor([tertiary_id] * batch_size, dtype=torch.long)
             
             comp_types = ['none', 'sequential', 'nested', 'parallel']
             comp_target_idx = comp_types.index(target_program['comp_type'])
@@ -103,11 +107,23 @@ class TRMTrainer:
             # Compute losses
             primary_loss = F.cross_entropy(primary_logits, primary_target)
             secondary_loss = F.cross_entropy(secondary_logits, secondary_target)
+            tertiary_loss = F.cross_entropy(tertiary_logits, tertiary_target)
             comp_loss = F.cross_entropy(composition_logits, comp_target)
             halt_loss = F.binary_cross_entropy_with_logits(halt_logits, torch.ones_like(halt_logits))
             
-            step_loss = primary_loss + secondary_loss + comp_loss + 0.1 * halt_loss
+            # Weight tertiary loss less if not used
+            tertiary_weight = 1.0 if target_program.get('tertiary_id') is not None else 0.1
+            
+            step_loss = primary_loss + secondary_loss + tertiary_weight * tertiary_loss + comp_loss + 0.1 * halt_loss
             total_loss += step_loss
+            
+            # IMPORTANT: Detach carry after each step to prevent graph retention
+            carry = SymbolicTRMCarry(
+                z_H=carry.z_H.detach(),
+                z_L=carry.z_L.detach(),
+                steps=carry.steps,
+                halted=carry.halted
+            )
         
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -155,16 +171,16 @@ class TRMTrainer:
         seq_len = self.config['seq_len']
         d_model = self.config['hidden_size']
         
-        # Initialize carry - use correct field names
-        carry = SymbolicTRMCarry(
-            z_H=torch.zeros(batch_size, seq_len, d_model),
-            z_L=torch.zeros(batch_size, seq_len, d_model),
-            steps=torch.zeros(batch_size, dtype=torch.int32),
-            halted=torch.ones(batch_size, dtype=torch.bool)
-        )
-        carry = self.model.reset_carry(carry.halted, carry)
-        
         for epoch in range(num_epochs):
+            # IMPORTANT: Create fresh carry each epoch to avoid graph retention
+            carry = SymbolicTRMCarry(
+                z_H=torch.zeros(batch_size, seq_len, d_model),
+                z_L=torch.zeros(batch_size, seq_len, d_model),
+                steps=torch.zeros(batch_size, dtype=torch.int32),
+                halted=torch.ones(batch_size, dtype=torch.bool)
+            )
+            carry = self.model.reset_carry(carry.halted, carry)
+            
             self.optimizer.zero_grad()
             
             # Forward pass
@@ -184,51 +200,63 @@ class TRMTrainer:
     def _compute_loss(self, output, comp_data: Dict, examples: List) -> torch.Tensor:
         """Compute training loss."""
         
-        # Target function IDs
         primary_target = comp_data['primary_id']
         secondary_target = comp_data.get('secondary_id')
+        tertiary_target = comp_data.get('tertiary_id')
         
-        # Composition type targets
         comp_type_map = {'none': 0, 'sequential': 1, 'nested': 2, 'parallel': 3}
         comp_type_target = comp_type_map[comp_data['comp_type']]
         
-        # Pool logits if they have sequence dimension
+        # Pool logits
         primary_logits = output['primary_logits']
         if primary_logits.dim() == 3:
             primary_logits = primary_logits.mean(dim=1)
             secondary_logits = output['secondary_logits'].mean(dim=1)
+            tertiary_logits = output['tertiary_logits'].mean(dim=1)
             composition_logits = output['composition_logits'].mean(dim=1)
         else:
             secondary_logits = output['secondary_logits']
+            tertiary_logits = output['tertiary_logits']
             composition_logits = output['composition_logits']
         
         batch_size = primary_logits.shape[0]
         
-        # Compute losses
+        # Primary loss
         loss_primary = torch.nn.functional.cross_entropy(
             primary_logits,
             torch.tensor([primary_target] * batch_size, dtype=torch.long)
         )
         
-        # Only compute secondary loss if secondary function is used
+        # Secondary loss
         if secondary_target is not None:
             loss_secondary = torch.nn.functional.cross_entropy(
                 secondary_logits,
                 torch.tensor([secondary_target] * batch_size, dtype=torch.long)
             )
         else:
-            # For 'none' composition, predict 0 (or first function) as dummy
             loss_secondary = torch.nn.functional.cross_entropy(
                 secondary_logits,
                 torch.tensor([0] * batch_size, dtype=torch.long)
-            ) * 0.1  # Reduced weight since it's not meaningful
+            ) * 0.1
         
+        # Tertiary loss
+        if tertiary_target is not None:
+            loss_tertiary = torch.nn.functional.cross_entropy(
+                tertiary_logits,
+                torch.tensor([tertiary_target] * batch_size, dtype=torch.long)
+            )
+        else:
+            loss_tertiary = torch.nn.functional.cross_entropy(
+                tertiary_logits,
+                torch.tensor([0] * batch_size, dtype=torch.long)
+            ) * 0.1
+        
+        # Composition type loss
         loss_comp_type = torch.nn.functional.cross_entropy(
             composition_logits,
             torch.tensor([comp_type_target] * batch_size, dtype=torch.long)
         )
         
-        # Total loss
-        total_loss = loss_primary + loss_secondary + loss_comp_type
+        total_loss = loss_primary + loss_secondary + loss_tertiary + loss_comp_type
         
         return total_loss

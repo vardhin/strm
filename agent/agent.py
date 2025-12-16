@@ -147,13 +147,11 @@ class SymbolicAgent:
         )
         carry = self.model.reset_carry(carry.halted, carry)
         
-        # Track what we've tried
         tried_candidates = set()
         
         for step in range(max_steps):
             print(f"\n  [TRM Search] Step {step+1}/{max_steps}...")
             
-            # Forward pass
             carry, output = self.model(carry, x_input)
             
             # Extract predictions
@@ -161,71 +159,64 @@ class SymbolicAgent:
             if primary_logits.dim() == 3:
                 primary_logits = primary_logits.mean(dim=1).mean(dim=0)
                 secondary_logits = output['secondary_logits'].mean(dim=1).mean(dim=0)
+                tertiary_logits = output['tertiary_logits'].mean(dim=1).mean(dim=0)
                 composition_logits = output['composition_logits'].mean(dim=1).mean(dim=0)
             else:
                 primary_logits = primary_logits.mean(dim=0)
                 secondary_logits = output['secondary_logits'].mean(dim=0)
+                tertiary_logits = output['tertiary_logits'].mean(dim=0)
                 composition_logits = output['composition_logits'].mean(dim=0)
             
-            # Get top-k predictions, but expand k over time
-            top_k = min(3 + step, len(primary_logits))  # Start at 3, grow to explore more
+            top_k = min(3 + step, len(primary_logits))
             comp_types = ['none', 'sequential', 'nested', 'parallel']
             
             _, primary_top = torch.topk(primary_logits, min(top_k, len(primary_logits)))
             _, secondary_top = torch.topk(secondary_logits, min(top_k, len(secondary_logits)))
+            _, tertiary_top = torch.topk(tertiary_logits, min(top_k, len(tertiary_logits)))
             _, comp_type_top = torch.topk(composition_logits, min(len(comp_types), len(composition_logits)))
             
             print(f"    Top {top_k} predictions:")
             print(f"      Primary: {[self.registry.metadata[idx.item()]['name'] for idx in primary_top[:5]]}")
             print(f"      Secondary: {[self.registry.metadata[idx.item()]['name'] for idx in secondary_top[:5]]}")
+            print(f"      Tertiary: {[self.registry.metadata[idx.item()]['name'] for idx in tertiary_top[:5]]}")
             print(f"      Comp types: {[comp_types[idx.item()] for idx in comp_type_top]}")
             
-            # Generate candidates
+            # Generate candidates with tertiary support
             candidates = self._generate_deep_candidates(
-                primary_top, secondary_top, comp_type_top, comp_types, max_terms
+                primary_top, secondary_top, tertiary_top, comp_type_top, comp_types, max_terms
             )
             
-            # Filter out already-tried candidates
+            # Filter duplicates
             new_candidates = []
             for cand in candidates:
-                key = (cand['primary_id'], cand['secondary_id'], cand['comp_type'], cand.get('loop_count', 1))
+                key = (cand['primary_id'], cand['secondary_id'], cand.get('tertiary_id'), 
+                       cand['comp_type'], cand.get('loop_count', 1))
                 if key not in tried_candidates:
                     tried_candidates.add(key)
                     new_candidates.append(cand)
             
             print(f"    Testing {len(new_candidates)} new candidates (total tried: {len(tried_candidates)})")
             
-            # Test candidates
             for rank, candidate in enumerate(new_candidates, 1):
                 if self._test_composition(candidate, examples):
                     self._print_solution(candidate)
                     return candidate
             
-            # If no solution found, modify carry to signal "try again"
-            # This encourages the model to explore different predictions
             if len(new_candidates) == 0:
                 print(f"    All candidates exhausted at this depth")
             
-            # Add small noise to encourage exploration in next iteration
+            # Add noise for exploration
             with torch.no_grad():
                 carry.z_H += torch.randn_like(carry.z_H) * 0.01
                 carry.z_L += torch.randn_like(carry.z_L) * 0.01
         
         print(f"\n  ✗ No solution found after {max_steps} steps")
         print(f"  Tried {len(tried_candidates)} unique candidates total")
-        
-        # Show what's missing
-        if len(tried_candidates) < 50:  # Only for small search spaces
-            print(f"\n  [Debug] The answer might require:")
-            print(f"    - NOT + AND combination (for NAND)")
-            print(f"    - A composition type not in top-3")
-            print(f"    - A function not in top-{top_k}")
-        
         return None
     
-    def _generate_deep_candidates(self, primary_top, secondary_top, comp_type_top, 
-                                 comp_types, max_terms: int) -> List[Dict]:
-        """Generate candidates up to max_terms depth."""
+    def _generate_deep_candidates(self, primary_top, secondary_top, tertiary_top, 
+                                 comp_type_top, comp_types, max_terms: int) -> List[Dict]:
+        """Generate candidates with tertiary combiner support."""
         candidates = []
         
         # Depth 1: Single functions
@@ -239,19 +230,17 @@ class SymbolicAgent:
                     'loop_count': 1
                 })
         
-        # Depth 2: Binary compositions f(g(x))
+        # Depth 2: Binary compositions
         if max_terms >= 2:
             for comp_idx in comp_type_top:
                 comp_type = comp_types[comp_idx.item()]
                 if comp_type == 'none':
                     continue
                 
-                # Try ALL combinations if top-k is small
-                # This ensures we don't miss obvious answers like NOT+AND
                 prim_list = primary_top
                 sec_list = secondary_top
                 
-                # If we have < 20 candidates so far, expand to all functions
+                # Expand search if space is small
                 if len(primary_top) * len(secondary_top) < 20:
                     all_fns = list(self.registry.functions.keys())
                     prim_list = torch.tensor([f for f in all_fns if f != self.registry.loop_id])
@@ -262,60 +251,70 @@ class SymbolicAgent:
                         prim_id = prim_idx if isinstance(prim_idx, int) else prim_idx.item()
                         sec_id = sec_idx if isinstance(sec_idx, int) else sec_idx.item()
                         
-                        # Check for dynamic loop
                         loop_count = 1
                         if sec_id == self.registry.loop_id:
                             prim_meta = self.registry.metadata.get(prim_id)
                             if prim_meta and prim_meta.get('arity') == 1:
                                 loop_count = -1
                         
-                        candidates.append({
-                            'primary_id': prim_id,
-                            'secondary_id': sec_id,
-                            'tertiary_id': None,
-                            'comp_type': comp_type,
-                            'loop_count': loop_count
-                        })
+                        # For parallel composition, try with combiners
+                        if comp_type == 'parallel':
+                            for tert_idx in tertiary_top:
+                                tert_id = tert_idx if isinstance(tert_idx, int) else tert_idx.item()
+                                candidates.append({
+                                    'primary_id': prim_id,
+                                    'secondary_id': sec_id,
+                                    'tertiary_id': tert_id,
+                                    'comp_type': comp_type,
+                                    'loop_count': loop_count
+                                })
+                        else:
+                            candidates.append({
+                                'primary_id': prim_id,
+                                'secondary_id': sec_id,
+                                'tertiary_id': None,
+                                'comp_type': comp_type,
+                                'loop_count': loop_count
+                            })
         
-        # Depth 3+: Nested compositions f(g(h(x)))
-        # For now, we treat learned functions as single units
-        # So NAND(OR(x,y), AND(x,y)) is still depth 2 in our representation
-        # True depth 3+ would require recursive composition building
-        
+        # Depth 3+: Use learned functions
         if max_terms >= 3:
-            # Try using learned abstractions as building blocks
             learned_fns = [fid for fid, meta in self.registry.metadata.items() 
-                          if meta.get('layer', 0) > 0]  # Layer > 0 means learned
+                          if meta.get('layer', 0) > 0]
             
             if learned_fns:
-                print(f"      Trying with {len(learned_fns)} learned functions...")
+                print(f"      Trying {len(learned_fns)} learned functions...")
                 
                 for comp_idx in comp_type_top:
                     comp_type = comp_types[comp_idx.item()]
                     if comp_type == 'none':
                         continue
                     
-                    # Try learned functions as primary
-                    for learned_id in learned_fns[:3]:  # Top 3 learned
-                        for sec_idx in secondary_top:
-                            candidates.append({
-                                'primary_id': learned_id,
-                                'secondary_id': sec_idx.item(),
-                                'tertiary_id': None,
-                                'comp_type': comp_type,
-                                'loop_count': 1
-                            })
+                    # Parallel with learned functions - KEY FOR XOR!
+                    if comp_type == 'parallel':
+                        # Try: combiner(LEARNED(x,y), PRIMITIVE(x,y))
+                        for learned_id in learned_fns:
+                            for prim_idx in primary_top:
+                                for tert_idx in tertiary_top:
+                                    candidates.append({
+                                        'primary_id': learned_id,
+                                        'secondary_id': prim_idx.item(),
+                                        'tertiary_id': tert_idx.item(),
+                                        'comp_type': 'parallel',
+                                        'loop_count': 1
+                                    })
                     
-                    # Try learned functions as secondary
-                    for prim_idx in primary_top:
-                        for learned_id in learned_fns[:3]:
-                            candidates.append({
-                                'primary_id': prim_idx.item(),
-                                'secondary_id': learned_id,
-                                'tertiary_id': None,
-                                'comp_type': comp_type,
-                                'loop_count': 1
-                            })
+                    # Sequential/nested with learned functions
+                    else:
+                        for prim_idx in primary_top:
+                            for learned_id in learned_fns:
+                                candidates.append({
+                                    'primary_id': prim_idx.item(),
+                                    'secondary_id': learned_id,
+                                    'tertiary_id': None,
+                                    'comp_type': comp_type,
+                                    'loop_count': 1
+                                })
         
         return candidates
     
@@ -412,8 +411,8 @@ class SymbolicAgent:
         new_vocab_size = self.registry.get_vocab_size()
         self.config['max_functions'] = new_vocab_size
         
-        # Only resize heads that exist in the model
-        heads_to_resize = ['head_primary_op', 'head_secondary_op']
+        # Resize all function prediction heads
+        heads_to_resize = ['head_primary_op', 'head_secondary_op', 'head_tertiary_op']
         
         for head_name in heads_to_resize:
             if not hasattr(self.model, head_name):
