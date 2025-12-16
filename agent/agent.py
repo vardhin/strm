@@ -6,6 +6,7 @@ from trm import SymbolicTRMCore, SymbolicTRMCarry
 from layers import CastedLinear
 from .search import ProgramSearcher
 from .training import TRMTrainer
+from .simplifier import CompositionSimplifier
 
 class SymbolicAgent:
     """Main orchestrator for symbolic reasoning with TRM."""
@@ -52,6 +53,9 @@ class SymbolicAgent:
         self.trainer = TRMTrainer(
             self.model, self.optimizer, self.config, registry
         )
+        
+        # Add simplifier
+        self.simplifier = CompositionSimplifier(registry, self.model, self.executor)
 
     def train_on_curriculum(self, num_epochs: int = 20):
         """Pre-train on curriculum tasks."""
@@ -77,41 +81,141 @@ class SymbolicAgent:
     def learn_abstraction(self, name: str, examples: List[Tuple[List[int], int]], 
                          num_epochs: int = 30, exploration_bonus: float = 0.5,
                          max_terms: int = 2) -> bool:
-        """Learn a new abstraction from examples using pure TRM learning.
+        """Learn a new abstraction from examples."""
+        print(f"\n{'='*60}")
+        print(f"Learning: {name}")
+        print(f"{'='*60}")
         
-        Args:
-            name: Name of the abstraction
-            examples: Training examples
-            num_epochs: Number of training epochs
-            exploration_bonus: Exploration bonus for sampling
-            max_terms: Maximum composition depth (2=binary, 3=ternary, etc.)
-        """
-        print("\n" + "="*60)
-        print(f"Learning Abstraction: {name}")
-        print(f"  Max composition depth: {max_terms}")
-        print("="*60)
+        # Phase 1: Find ANY working composition
+        candidate = self.search_with_trm(
+            examples, 
+            max_steps=10,
+            confidence_threshold=0.8,
+            exploration_bonus=exploration_bonus,
+            max_terms=max_terms
+        )
         
-        # Search using TRM with specified depth
-        comp_data = self.search_with_trm(examples, exploration_bonus=exploration_bonus, max_terms=max_terms)
-        
-        if comp_data is None:
-            print(f"\n  [Failed] Could not find program for {name}")
-            print(f"  Suggestion: Try more epochs, increase exploration_bonus, or increase max_terms")
+        if not candidate:
+            print(f"\n  ✗ Could not find composition for {name}")
             return False
         
-        # Found a solution! Train TRM to predict it
-        print(f"\n  [Training] Training TRM to predict this composition...")
-        self._train_on_composition(comp_data, examples, num_epochs=num_epochs)
-        print(f"  [Training] Complete!")
+        print(f"\n  ✓ Found working composition!")
         
-        # Register the new function
-        fid = self._register_abstraction(name, comp_data, examples)
+        # Phase 2: SIMPLIFY the composition
+        original_composition = self._build_composition_from_candidate(candidate, examples)
+        simplified_composition = self.simplifier.simplify(original_composition, examples)
         
-        # Resize model to accommodate new function
+        # Phase 3: Train on the ORIGINAL candidate (not simplified)
+        # because the model learned to predict this specific composition
+        self._train_on_composition(candidate, examples, num_epochs=num_epochs)
+        
+        # Phase 4: Register the SIMPLIFIED composition directly
+        # This is what gets saved to the database and used for execution
+        input_arity = len(examples[0][0])
+        func_id = self.registry.register_composition(name, input_arity, simplified_composition)
+        
+        print(f"\n  [Memory] Saved '{name}' as Function ID {func_id}")
+        print(f"    Final composition: {[(self.registry.metadata[cid]['name'], args) for cid, args in simplified_composition]}")
+        
+        # Expand model vocabulary
         self.resize_model_for_new_abstraction()
         
         return True
+
+    def _build_composition_from_candidate(self, candidate: Dict, examples: List) -> List[Tuple[int, List[int]]]:
+        """Convert candidate dict to composition list."""
+        composition = []
+        input_arity = len(examples[0][0])
+        comp_type = candidate['comp_type']
+        
+        if comp_type == 'none':
+            composition.append((candidate['primary_id'], list(range(input_arity))))
+        
+        elif comp_type == 'sequential':
+            primary_meta = self.registry.metadata[candidate['primary_id']]
+            secondary_meta = self.registry.metadata[candidate['secondary_id']]
+            
+            # Use arity to determine correct order
+            if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
+                composition.append((candidate['primary_id'], list(range(input_arity))))
+                composition.append((candidate['secondary_id'], [input_arity]))
+            else:
+                composition.append((candidate['secondary_id'], list(range(input_arity))))
+                composition.append((candidate['primary_id'], [input_arity]))
+        
+        elif comp_type == 'nested':
+            # primary(secondary(x), secondary(y))
+            composition.append((candidate['secondary_id'], [0]))
+            composition.append((candidate['secondary_id'], [1]))
+            composition.append((candidate['primary_id'], [input_arity, input_arity + 1]))
+        
+        elif comp_type == 'parallel':
+            # tertiary(primary(x,y), secondary(x,y))
+            composition.append((candidate['primary_id'], list(range(input_arity))))
+            composition.append((candidate['secondary_id'], list(range(input_arity))))
+            
+            if candidate.get('tertiary_id') is not None:
+                composition.append((candidate['tertiary_id'], [input_arity, input_arity + 1]))
+            else:
+                # Misclassified as parallel - treat as sequential
+                primary_meta = self.registry.metadata[candidate['primary_id']]
+                secondary_meta = self.registry.metadata[candidate['secondary_id']]
+                
+                if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
+                    composition = [
+                        (candidate['primary_id'], list(range(input_arity))),
+                        (candidate['secondary_id'], [input_arity])
+                    ]
+                else:
+                    composition = [
+                        (candidate['secondary_id'], list(range(input_arity))),
+                        (candidate['primary_id'], [input_arity])
+                    ]
+        
+        else:
+            raise ValueError(f"Unknown composition type: {comp_type}")
+        
+        return composition
     
+    def _candidate_from_composition(self, composition: List[Tuple[int, List[int]]], arity: int) -> Dict:
+        """Convert composition list back to candidate dict."""
+        # Reverse the process - infer comp_type from composition structure
+        if len(composition) == 1:
+            return {
+                'primary_id': composition[0][0],
+                'secondary_id': None,
+                'tertiary_id': None,
+                'comp_type': 'none'
+            }
+        elif len(composition) == 2:
+            return {
+                'primary_id': composition[0][0],
+                'secondary_id': composition[1][0],
+                'tertiary_id': None,
+                'comp_type': 'sequential'
+            }
+        elif len(composition) == 3:
+            # Check if it's nested or parallel
+            prim_id, sec_id = composition[0][0], composition[1][0]
+            tert_id = composition[2][0] if composition[2][1] == [0, 1] else None
+            
+            if tert_id is not None:
+                return {
+                    'primary_id': prim_id,
+                    'secondary_id': sec_id,
+                    'tertiary_id': tert_id,
+                    'comp_type': 'parallel'
+                }
+            else:
+                return {
+                    'primary_id': prim_id,
+                    'secondary_id': sec_id,
+                    'tertiary_id': None,
+                    'comp_type': 'nested'
+                }
+        
+        return {'primary_id': composition[0][0], 'secondary_id': None, 'tertiary_id': None, 'comp_type': 'none'}
+
     def _train_on_composition(self, comp_data: Dict, examples: List[Tuple[List[int], int]], 
                              num_epochs: int = 30):
         """Train TRM to predict a composition."""
@@ -365,89 +469,9 @@ class SymbolicAgent:
         )
 
     def _register_abstraction(self, name: str, comp_data: Dict, examples: List) -> int:
-        """Register new abstraction in registry."""
-        # Build composition list from comp_data
-        composition = []
-        
-        # Get input arity from examples
-        input_arity = len(examples[0][0])
-        comp_type = comp_data['comp_type']
-        
-        if comp_type == 'none':
-            # Just a single function
-            composition.append((comp_data['primary_id'], list(range(input_arity))))
-        
-        elif comp_type == 'sequential':
-            # secondary(primary(x, y)) - chain them
-            # PRIMARY is the INNER function, SECONDARY is the OUTER function
-            # So we need to check which one should go first based on arity
-            
-            primary_meta = self.registry.metadata[comp_data['primary_id']]
-            secondary_meta = self.registry.metadata[comp_data['secondary_id']]
-            
-            # If primary arity matches inputs, it's the inner function
-            if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
-                # Normal order: primary(inputs), then secondary(result)
-                composition.append((comp_data['primary_id'], list(range(input_arity))))
-                composition.append((comp_data['secondary_id'], [input_arity]))
-            else:
-                # Swapped: secondary should be inner, primary is outer
-                # This happens when search finds them in reverse order
-                composition.append((comp_data['secondary_id'], list(range(input_arity))))
-                composition.append((comp_data['primary_id'], [input_arity]))
-        
-        elif comp_type == 'nested':
-            # primary(secondary(x), secondary(y))
-            # First compute secondary(x) - result at index input_arity
-            composition.append((comp_data['secondary_id'], [0]))
-            # Then compute secondary(y) - result at index input_arity + 1
-            composition.append((comp_data['secondary_id'], [1]))
-            # Finally apply primary to both results
-            composition.append((comp_data['primary_id'], [input_arity, input_arity + 1]))
-        
-        elif comp_type == 'parallel':
-            # tertiary(primary(x,y), secondary(x,y))
-            # First compute primary
-            composition.append((comp_data['primary_id'], list(range(input_arity))))
-            # Then compute secondary
-            composition.append((comp_data['secondary_id'], list(range(input_arity))))
-            # Finally combine with tertiary (results are at indices input_arity and input_arity+1)
-            if comp_data.get('tertiary_id') is not None:
-                composition.append((comp_data['tertiary_id'], [input_arity, input_arity + 1]))
-            # If no tertiary but it's marked parallel, treat as sequential
-            elif comp_data['secondary_id'] is not None:
-                # This is actually a sequential composition misclassified as parallel
-                # Apply the arity-based ordering logic
-                primary_meta = self.registry.metadata[comp_data['primary_id']]
-                secondary_meta = self.registry.metadata[comp_data['secondary_id']]
-                
-                if primary_meta['arity'] == input_arity or primary_meta['arity'] == -1:
-                    composition = [
-                        (comp_data['primary_id'], list(range(input_arity))),
-                        (comp_data['secondary_id'], [input_arity])
-                    ]
-                else:
-                    composition = [
-                        (comp_data['secondary_id'], list(range(input_arity))),
-                        (comp_data['primary_id'], [input_arity])
-                    ]
-        
-        else:
-            raise ValueError(f"Unknown composition type: {comp_type}")
-        
-        # Use register_composition instead of register
-        fid = self.registry.register_composition(name, input_arity, composition)
-        
-        print(f"\n  [Memory] Saved '{name}' as Function ID {fid}")
-        print(f"    Composition: {[(self.registry.metadata[cid]['name'], args) for cid, args in composition]}")
-        return fid
-
-    def _register_discovered_function(self, name: str, arity: int, composition: List[Tuple[int, List[int]]]):
-        """Register a newly discovered function composition."""
-        # Use register_composition instead of register
-        func_id = self.registry.register_composition(name, arity, composition)
-        print(f"  [Agent] Registered {name} as function #{func_id}")
-        return func_id
+        """DEPRECATED: Use direct composition registration instead."""
+        # This method is no longer used - we register compositions directly
+        raise NotImplementedError("Use registry.register_composition directly")
 
     def format_examples(self, examples: List[Tuple[List[int], Any]]) -> torch.Tensor:
         """Format examples into tensor for TRM input."""
