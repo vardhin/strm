@@ -107,20 +107,23 @@ class SymbolicAgent:
         simplified_composition = self.simplifier.simplify(original_composition, examples)
         print(f"  [Debug] Simplified composition: {simplified_composition}")
         
-        # Phase 3: Register the SIMPLIFIED composition FIRST
-        # This is what gets saved to the database and used for execution
+        # Phase 3: CRITICAL - Get vocab size BEFORE registration
+        old_vocab_size = self.registry.get_vocab_size()
+        
+        # Phase 4: Register the SIMPLIFIED composition
         input_arity = len(examples[0][0])
         func_id = self.registry.register_composition(name, input_arity, simplified_composition)
         
         print(f"\n  [Memory] Saved '{name}' as Function ID {func_id}")
         print(f"    Final composition: {[(self.registry.metadata[cid]['name'], args) for cid, args in simplified_composition]}")
         
-        # Phase 4: Expand model vocabulary BEFORE training
-        self.resize_model_for_new_abstraction()
+        # Phase 5: Expand model vocabulary AFTER registration
+        new_vocab_size = self.registry.get_vocab_size()
+        if new_vocab_size > old_vocab_size:
+            print(f"  [Resize] Expanding vocabulary from {old_vocab_size} to {new_vocab_size}")
+            self._resize_model_with_old_size(old_vocab_size, new_vocab_size)
         
-        # Phase 5: Train on the ORIGINAL candidate (not simplified)
-        # because the model learned to predict this specific composition
-        # NOW with the fresh optimizer that matches the resized model
+        # Phase 6: Train on the ORIGINAL candidate
         self._train_on_composition(candidate, examples, num_epochs=num_epochs)
         
         return True
@@ -377,7 +380,7 @@ class SymbolicAgent:
                         loop_count = 1
                         if sec_id == self.registry.loop_id:
                             prim_meta = self.registry.metadata.get(prim_id)
-                            if prim_meta and prim_meta.get('arity') == 1:
+                            if prim_meta and prim_meta.get('arity') in [1, 2]:
                                 loop_count = -1
                         
                         # For parallel composition, try with combiners
@@ -400,44 +403,64 @@ class SymbolicAgent:
                                 'loop_count': loop_count
                             })
         
-        # Depth 3+: Use learned functions
+        # Depth 3+: Use learned functions ONLY if TRM suggests them
         if max_terms >= 3:
             learned_fns = [fid for fid, meta in self.registry.metadata.items() 
                           if meta.get('layer', 0) > 0]
             
             if learned_fns:
-                print(f"      Trying {len(learned_fns)} learned functions...")
+                # Filter learned functions: only use if they're in top predictions
+                learned_in_primary = [fid for fid in learned_fns if fid in primary_top.tolist()]
+                learned_in_secondary = [fid for fid in learned_fns if fid in secondary_top.tolist()]
                 
-                for comp_idx in comp_type_top:
-                    comp_type = comp_types[comp_idx.item()]
-                    if comp_type == 'none':
-                        continue
+                if learned_in_primary or learned_in_secondary:
+                    print(f"      TRM suggests {len(learned_in_primary)} learned fns in primary, {len(learned_in_secondary)} in secondary")
                     
-                    # Parallel with learned functions - KEY FOR XOR!
-                    if comp_type == 'parallel':
-                        # Try: combiner(LEARNED(x,y), PRIMITIVE(x,y))
-                        for learned_id in learned_fns:
+                    # ONLY try LOOP with learned functions if BOTH are predicted
+                    if self.registry.loop_id in secondary_top.tolist():
+                        for learned_id in learned_in_primary:
+                            learned_meta = self.registry.metadata[learned_id]
+                            if learned_meta.get('arity') == 2:
+                                # TRM predicted LOOP in secondary AND learned binary fn in primary
+                                # This is the pattern for MUL: LOOP(ADD, dynamic)
+                                candidates.append({
+                                    'primary_id': learned_id,
+                                    'secondary_id': self.registry.loop_id,
+                                    'tertiary_id': None,
+                                    'comp_type': 'sequential',
+                                    'loop_count': -1
+                                })
+                    
+                    # Try compositions with learned functions if TRM suggests them
+                    for comp_idx in comp_type_top:
+                        comp_type = comp_types[comp_idx.item()]
+                        if comp_type == 'none':
+                            continue
+                        
+                        # Parallel: combiner(LEARNED, PRIMITIVE)
+                        if comp_type == 'parallel':
+                            for learned_id in learned_in_primary:
+                                for prim_idx in primary_top:
+                                    for tert_idx in tertiary_top:
+                                        candidates.append({
+                                            'primary_id': learned_id,
+                                            'secondary_id': prim_idx.item(),
+                                            'tertiary_id': tert_idx.item(),
+                                            'comp_type': 'parallel',
+                                            'loop_count': 1
+                                        })
+                        
+                        # Sequential/nested: compose with learned functions
+                        else:
                             for prim_idx in primary_top:
-                                for tert_idx in tertiary_top:
+                                for learned_id in learned_in_secondary:
                                     candidates.append({
-                                        'primary_id': learned_id,
-                                        'secondary_id': prim_idx.item(),
-                                        'tertiary_id': tert_idx.item(),
-                                        'comp_type': 'parallel',
+                                        'primary_id': prim_idx.item(),
+                                        'secondary_id': learned_id,
+                                        'tertiary_id': None,
+                                        'comp_type': comp_type,
                                         'loop_count': 1
                                     })
-                    
-                    # Sequential/nested with learned functions
-                    else:
-                        for prim_idx in primary_top:
-                            for learned_id in learned_fns:
-                                candidates.append({
-                                    'primary_id': prim_idx.item(),
-                                    'secondary_id': learned_id,
-                                    'tertiary_id': None,
-                                    'comp_type': comp_type,
-                                    'loop_count': 1
-                                })
         
         return candidates
     
@@ -526,18 +549,22 @@ class SymbolicAgent:
                 
             old_head = getattr(self.model, head_name)
             
-            if old_vocab_size >= new_vocab_size:
+            # Get ACTUAL current size from the head itself
+            actual_old_size = old_head.weight.shape[0]
+            
+            if actual_old_size >= new_vocab_size:
                 continue  # Already big enough
             
+            # Create new head with target size
             new_head = CastedLinear(self.d_model, new_vocab_size, bias=False)
             
             with torch.no_grad():
-                # Copy old weights
-                new_head.weight[:old_vocab_size] = old_head.weight
+                # Copy ALL existing weights (use actual size, not parameter)
+                new_head.weight[:actual_old_size] = old_head.weight
                 # Initialize new weights with small noise around mean
                 avg_weight = old_head.weight.mean(dim=0)
-                new_head.weight[old_vocab_size:] = avg_weight.unsqueeze(0) + torch.randn(
-                    new_vocab_size - old_vocab_size, self.d_model
+                new_head.weight[actual_old_size:] = avg_weight.unsqueeze(0) + torch.randn(
+                    new_vocab_size - actual_old_size, self.d_model
                 ) * 0.01
             
             setattr(self.model, head_name, new_head)
@@ -558,6 +585,39 @@ class SymbolicAgent:
         old_lr = self.optimizer.param_groups[0]['lr']
         
         # Resize model heads AFTER saving LR but BEFORE touching optimizer
+        self._resize_model_heads(old_vocab_size, new_vocab_size)
+        
+        # Delete trainer FIRST (it holds reference to optimizer)
+        if hasattr(self, 'trainer'):
+            del self.trainer
+        
+        # Delete optimizer
+        del self.optimizer
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Create COMPLETELY fresh optimizer with resized parameters
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=old_lr)
+        
+        # Create trainer with the fresh optimizer
+        self.trainer = TRMTrainer(
+            self.model, self.optimizer, self.config, self.registry
+        )
+        
+        print(f"  [Resize] Model vocabulary expanded to {new_vocab_size} functions")
+
+    def _resize_model_with_old_size(self, old_vocab_size: int, new_vocab_size: int):
+        """Resize model with explicit old vocabulary size."""
+        # Update config
+        self.config['max_functions'] = new_vocab_size
+        
+        # CRITICAL: Get learning rate BEFORE any changes
+        old_lr = self.optimizer.param_groups[0]['lr']
+        
+        # Resize model heads
         self._resize_model_heads(old_vocab_size, new_vocab_size)
         
         # Delete trainer FIRST (it holds reference to optimizer)

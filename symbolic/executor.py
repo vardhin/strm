@@ -16,22 +16,12 @@ class ProgramExecutor:
             return self.registry.functions[primary_id](inputs)
         
         elif comp_type == 'sequential':
-            # f(g(inputs))
-            if secondary_id == self.registry.loop_id and loop_count == -1:
-                # Dynamic loop: apply f multiple times based on second input
-                result = inputs[0]
-                times = inputs[1]
-                for _ in range(times):
-                    result = self.registry.functions[primary_id]([result])
-                return result
-            elif secondary_id == self.registry.loop_id:
-                # Fixed loop
-                result = inputs[0]
-                for _ in range(loop_count):
-                    result = self.registry.functions[primary_id]([result])
-                return result
+            # Check if this is a LOOP composition
+            if secondary_id == self.registry.loop_id:
+                # Use the dedicated loop executor
+                return self._execute_loop(primary_id, inputs, loop_count)
             else:
-                # Regular sequential composition
+                # Regular sequential composition: f(g(inputs))
                 intermediate = self.registry.functions[secondary_id](inputs)
                 return self.registry.functions[primary_id]([intermediate])
         
@@ -41,19 +31,14 @@ class ProgramExecutor:
             return self.registry.functions[primary_id](transformed)
         
         elif comp_type == 'parallel':
-            # NEW: combiner(f(inputs), g(inputs))
-            # Compute both functions on the same inputs, then combine
+            # combiner(f(inputs), g(inputs))
             if tertiary_id is None:
-                # Default: just return first result (shouldn't happen)
                 result_f = self.registry.functions[primary_id](inputs)
                 result_g = self.registry.functions[secondary_id](inputs) if secondary_id else result_f
                 return result_f
             else:
-                # Apply both functions, then combine with tertiary
                 result_f = self.registry.functions[primary_id](inputs)
                 result_g = self.registry.functions[secondary_id](inputs)
-                
-                # Combiner takes both results as inputs
                 return self.registry.functions[tertiary_id]([result_f, result_g])
         
         else:
@@ -108,3 +93,46 @@ class ProgramExecutor:
             raise ValueError(f"Tertiary function must accept 2 inputs, got arity {self.registry.metadata[tertiary_id]['arity']}")
         
         return self.registry.execute_function(tertiary_id, [result1, result2])
+    
+    def _execute_loop(self, func_id: int, inputs: List[int], loop_count: int) -> int:
+        """Execute a function in a loop.
+        
+        For MUL: LOOP(ADD, inputs=[a, b])
+        Should compute: 0 + a + a + ... (b times) = a * b
+        """
+        # Handle encoded function ID
+        if func_id < 0:
+            actual_func_id = -(func_id + 1)
+        else:
+            actual_func_id = func_id
+        
+        # Get count
+        if loop_count == -1:
+            count = inputs[1]
+        else:
+            count = loop_count
+        
+        # Special case: if count is 0, return 0 for multiplication
+        if count == 0:
+            return 0
+        
+        # Get function metadata
+        func_meta = self.registry.metadata.get(actual_func_id)
+        if not func_meta:
+            raise ValueError(f"Unknown function ID: {actual_func_id}")
+        
+        # Execute loop
+        accumulator = 0  # CRITICAL: Start at 0 for multiplication pattern
+        
+        for _ in range(count):
+            if func_meta['arity'] == 1:
+                # Unary: f(accumulator)
+                accumulator = self.registry.execute_function(actual_func_id, [accumulator])
+            elif func_meta['arity'] == 2:
+                # Binary: ADD(accumulator, inputs[0])
+                # This gives us: 0 + a + a + ... = a * b
+                accumulator = self.registry.execute_function(actual_func_id, [accumulator, inputs[0]])
+            else:
+                raise ValueError(f"LOOP only supports unary or binary functions")
+        
+        return accumulator

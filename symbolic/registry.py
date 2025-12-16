@@ -47,91 +47,83 @@ class SymbolicRegistry:
         return fid
 
     def register_composition(self, name: str, arity: int, composition: List[Tuple[int, List[int]]]) -> int:
-        """Register a learned abstraction and save to DB.
+        """Register a new composite function."""
+        # Validate composition
+        if not composition:
+            raise ValueError("Composition cannot be empty")
         
-        Args:
-            name: Function name
-            arity: Number of arguments
-            composition: List of (child_func_id, arg_indices) tuples
+        # Check if name already exists
+        for fid, meta in self.metadata.items():
+            if meta['name'] == name:
+                print(f"  [Warning] Function '{name}' already exists with ID {fid}")
+                return fid
         
-        Returns:
-            New function ID
-        """
-        func_id = self._next_id
-        
-        # Create executable function from composition
-        def composed_fn(inputs, comp=composition):
-            # Start with original inputs as a list
-            available_values = list(inputs) if isinstance(inputs, list) else [inputs]
+        # Create composed function
+        def composed_fn(inputs):
+            available_values = list(inputs)
             
-            # Execute each function in the composition
-            for child_id, arg_indices in comp:
-                # Get the child function's metadata
-                child_meta = self.metadata[child_id]
-                child_arity = child_meta['arity']
-                
-                # Build child inputs by mapping indices to available values
-                child_inputs = []
-                for idx in arg_indices:
-                    # Negative indices encode literal function IDs
-                    if idx < 0:
-                        # Decode: idx = -func_id-1, so func_id = -idx-1
-                        func_id = -idx - 1
-                        child_inputs.append(func_id)
-                    elif idx < len(available_values):
-                        child_inputs.append(available_values[idx])
-                    else:
-                        raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
-                
-                # Special handling for LOOP (arity=-1)
-                if child_id == self.loop_id and child_meta['name'] == 'LOOP':
-                    if len(child_inputs) != 3:
-                        raise ValueError(f"LOOP expects 3 args: (func_id, start, count), got {len(child_inputs)}")
+            for func_id, args in composition:
+                # Special handling for LOOP with encoded function ID
+                if func_id == self.loop_id and len(args) > 0 and args[0] < 0:
+                    # This is LOOP with a learned function
+                    # args = [encoded_func_id, start_input_idx, count_input_idx]
+                    from .executor import ProgramExecutor
+                    executor = ProgramExecutor(self)
                     
-                    # child_inputs = [func_id, start_value, count]
-                    loop_func_id = child_inputs[0]
-                    start_value = child_inputs[1]
-                    count = child_inputs[2]
+                    # Extract the function ID from encoding
+                    loop_func_id = -(args[0] + 1)
                     
-                    # Apply the function 'count' times
-                    result = start_value
-                    for _ in range(count):
-                        result = self.execute_function(loop_func_id, [result])
-                
-                # Normal function execution
-                elif child_arity != -1:
-                    # Ensure we have the right number of arguments
-                    if len(child_inputs) != child_arity:
-                        raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                    # Get the actual input values for the loop
+                    loop_inputs = [available_values[args[i]] for i in range(1, len(args))]
                     
-                    # Execute the child function
-                    result = self.execute_function(child_id, child_inputs)
-                
+                    # Execute loop with dynamic count (-1)
+                    result = executor._execute_loop(loop_func_id, loop_inputs, loop_count=-1)
+                    available_values.append(result)
                 else:
-                    # Variable arity function (not LOOP) - just pass all args
-                    result = self.execute_function(child_id, child_inputs)
-                
-                # Add result to available values for next function
-                available_values.append(result)
+                    # Normal composition step
+                    step_inputs = []
+                    for idx in args:
+                        if idx < 0 or idx >= len(available_values):
+                            raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
+                        step_inputs.append(available_values[idx])
+                    
+                    result = self.execute_function(func_id, step_inputs)
+                    available_values.append(result)
             
-            # Return the last computed value
             return available_values[-1]
         
+        # Calculate layer (max of component layers + 1)
+        max_layer = 0
+        for func_id, _ in composition:
+            if func_id in self.metadata:
+                func_layer = self.metadata[func_id].get('layer', 0)
+                max_layer = max(max_layer, func_layer)
+        
+        layer = max_layer + 1
+        
+        # Get next function ID
+        func_id = max(self.functions.keys()) + 1 if self.functions else 0
+        
+        # Convert composition to JSON-serializable format
+        composition_json = json.dumps(composition)
+        
+        # Add to database using SymbolicDB
+        self.db.conn.execute('''
+            INSERT INTO functions (id, name, arity, composition, layer)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (func_id, name, arity, composition_json, layer))
+        self.db.conn.commit()
+        
+        # Register in memory
         self.functions[func_id] = composed_fn
-        self.metadata[func_id] = {"name": name, "arity": arity, "layer": -1}  # will be set by DB
-        self.compositions[func_id] = {
-            'terms': composition
+        self.metadata[func_id] = {
+            'name': name,
+            'arity': arity,
+            'composition': composition,
+            'layer': layer
         }
-        self._next_id += 1
         
-        # Save to database - this calculates layer automatically AND commits
-        self.db.add_abstraction(func_id, name, arity, composition)
-        
-        # Update layer in metadata from DB
-        db_func = self.db.get_function(func_id)
-        if db_func:
-            self.metadata[func_id]['layer'] = db_func['layer']
-        
+        print(f"  [DB] Added {name} at layer {layer} with {len(composition)} terms (id={func_id})")
         return func_id
 
     def save(self, path: str = "checkpoints/registry.pkl"):
