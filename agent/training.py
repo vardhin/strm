@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Any, Dict
 from symbolic import SymbolicRegistry, CurriculumGenerator
+from trm import SymbolicTRMCarry
 
 class TRMTrainer:
     """Handles training of the TRM model."""
@@ -43,14 +44,12 @@ class TRMTrainer:
     def train_step(self, examples: List[Tuple[List[int], Any]], 
                    target_program: Dict, format_fn) -> float:
         """Train with deep supervision across recursive steps."""
-        import torch
-        import torch.nn.functional as F
         
         self.model.train()
         x_input = format_fn(examples)
         batch_size = x_input.shape[0]
         
-        from trm import SymbolicTRMCarry
+        # Initialize carry
         carry = SymbolicTRMCarry(
             z_H=torch.zeros(batch_size, self.config['seq_len'], self.config['hidden_size']),
             z_L=torch.zeros(batch_size, self.config['seq_len'], self.config['hidden_size']),
@@ -147,3 +146,89 @@ class TRMTrainer:
             })
         
         print("\n  [Curriculum] Pre-training complete!\n")
+    
+    def train_on_examples(self, x_input: torch.Tensor, comp_data: Dict, 
+                         examples: List[Tuple[List[int], int]], num_epochs: int = 30):
+        """Train model on examples."""
+        
+        batch_size = x_input.shape[0]
+        seq_len = self.config['seq_len']
+        d_model = self.config['hidden_size']
+        
+        # Initialize carry - use correct field names
+        carry = SymbolicTRMCarry(
+            z_H=torch.zeros(batch_size, seq_len, d_model),
+            z_L=torch.zeros(batch_size, seq_len, d_model),
+            steps=torch.zeros(batch_size, dtype=torch.int32),
+            halted=torch.ones(batch_size, dtype=torch.bool)
+        )
+        carry = self.model.reset_carry(carry.halted, carry)
+        
+        for epoch in range(num_epochs):
+            self.optimizer.zero_grad()
+            
+            # Forward pass
+            carry, output = self.model(carry, x_input)
+            
+            # Compute loss
+            loss = self._compute_loss(output, comp_data, examples)
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            if epoch % 10 == 0:
+                print(f"      Epoch {epoch}: Loss = {loss.item():.4f}")
+    
+    def _compute_loss(self, output, comp_data: Dict, examples: List) -> torch.Tensor:
+        """Compute training loss."""
+        
+        # Target function IDs
+        primary_target = comp_data['primary_id']
+        secondary_target = comp_data.get('secondary_id')
+        
+        # Composition type targets
+        comp_type_map = {'none': 0, 'sequential': 1, 'nested': 2, 'parallel': 3}
+        comp_type_target = comp_type_map[comp_data['comp_type']]
+        
+        # Pool logits if they have sequence dimension
+        primary_logits = output['primary_logits']
+        if primary_logits.dim() == 3:
+            primary_logits = primary_logits.mean(dim=1)
+            secondary_logits = output['secondary_logits'].mean(dim=1)
+            composition_logits = output['composition_logits'].mean(dim=1)
+        else:
+            secondary_logits = output['secondary_logits']
+            composition_logits = output['composition_logits']
+        
+        batch_size = primary_logits.shape[0]
+        
+        # Compute losses
+        loss_primary = torch.nn.functional.cross_entropy(
+            primary_logits,
+            torch.tensor([primary_target] * batch_size, dtype=torch.long)
+        )
+        
+        # Only compute secondary loss if secondary function is used
+        if secondary_target is not None:
+            loss_secondary = torch.nn.functional.cross_entropy(
+                secondary_logits,
+                torch.tensor([secondary_target] * batch_size, dtype=torch.long)
+            )
+        else:
+            # For 'none' composition, predict 0 (or first function) as dummy
+            loss_secondary = torch.nn.functional.cross_entropy(
+                secondary_logits,
+                torch.tensor([0] * batch_size, dtype=torch.long)
+            ) * 0.1  # Reduced weight since it's not meaningful
+        
+        loss_comp_type = torch.nn.functional.cross_entropy(
+            composition_logits,
+            torch.tensor([comp_type_target] * batch_size, dtype=torch.long)
+        )
+        
+        # Total loss
+        total_loss = loss_primary + loss_secondary + loss_comp_type
+        
+        return total_loss

@@ -14,36 +14,42 @@ class ProgramExecutor:
         """Execute a composed program."""
         
         if comp_type == 'none':
-            # Single function application
             return self.registry.execute_function(primary_id, inputs)
-        
-        primary_meta = self.registry.metadata[primary_id]
         
         if comp_type == 'sequential':
             if secondary_id == self.registry.loop_id:
-                # LOOP composition: repeat primary_id loop_count times
+                # LOOP: repeat primary function loop_count times
                 result = inputs[0] if len(inputs) == 1 else inputs
                 for _ in range(loop_count):
-                    # Pass as list for consistency
                     result = self.registry.execute_function(primary_id, [result] if not isinstance(result, list) else result)
                 return result
             else:
-                # Sequential composition: secondary(primary(inputs))
+                # Sequential: secondary(primary(inputs))
                 intermediate = self.registry.execute_function(primary_id, inputs)
                 return self.registry.execute_function(secondary_id, [intermediate])
         
         elif comp_type == 'nested':
-            # Nested composition: primary(secondary(x) for each x in inputs)
+            # Nested composition needs to check arity
             secondary_meta = self.registry.metadata[secondary_id]
+            secondary_arity = secondary_meta['arity']
             
-            # Apply secondary to each input individually
-            transformed = [self.registry.execute_function(secondary_id, [x]) for x in inputs]
-            
-            # Apply primary to the transformed results
-            return self.registry.execute_function(primary_id, transformed)
+            if secondary_arity == 1:
+                # Apply secondary to each element: primary([secondary(x) for x in inputs])
+                transformed = [self.registry.execute_function(secondary_id, [x]) for x in inputs]
+                return self.registry.execute_function(primary_id, transformed)
+            elif secondary_arity == 2:
+                # If secondary needs 2 args but we have 2 inputs, just apply it directly
+                # This is a degenerate case: nested doesn't make sense here
+                # Fall back to just applying secondary to inputs
+                result = self.registry.execute_function(secondary_id, inputs)
+                return self.registry.execute_function(primary_id, [result])
+            else:
+                # For higher arity, apply secondary to all inputs
+                result = self.registry.execute_function(secondary_id, inputs)
+                return self.registry.execute_function(primary_id, [result])
         
         elif comp_type == 'parallel':
-            # Parallel composition: tertiary(primary(inputs), secondary(inputs))
+            # Parallel: tertiary(primary(inputs), secondary(inputs))
             result1 = self.registry.execute_function(primary_id, inputs)
             result2 = self.registry.execute_function(secondary_id, inputs)
             return self.registry.execute_function(tertiary_id, [result1, result2])

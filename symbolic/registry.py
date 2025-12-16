@@ -71,6 +71,10 @@ class SymbolicRegistry:
             self.functions[fid] = lambda inputs: inputs[0] & inputs[1]
         elif name == 'NOT':
             self.functions[fid] = lambda inputs: ~inputs[0]
+        elif name == 'INC':
+            self.functions[fid] = lambda inputs: inputs[0] + 1
+        elif name == 'DEC':
+            self.functions[fid] = lambda inputs: inputs[0] - 1
         elif name == 'LOOP':
             # LOOP is special - it's a higher-order function handled elsewhere
             pass
@@ -103,12 +107,21 @@ class SymbolicRegistry:
         
         elif comp_type == 'nested':
             # Rebuild nested composition: f1(f2(x) for each x in inputs)
-            def nested_fn(inputs, p=primary_id, s=secondary_id):
-                # Apply secondary to each input element
-                transformed = [self.execute_function(s, [x]) for x in inputs]
-                # Then apply primary to the transformed inputs
-                return self.execute_function(p, transformed)
-            self.functions[fid] = nested_fn
+            # But check if secondary expects multiple inputs
+            secondary_arity = self.metadata[secondary_id]['arity']
+            
+            if secondary_arity == 1:
+                # Apply secondary to each element individually
+                def nested_fn(inputs, p=primary_id, s=secondary_id):
+                    transformed = [self.execute_function(s, [x]) for x in inputs]
+                    return self.execute_function(p, transformed)
+                self.functions[fid] = nested_fn
+            else:
+                # Secondary needs multiple inputs - just pass inputs through
+                def nested_fn(inputs, p=primary_id, s=secondary_id):
+                    transformed = self.execute_function(s, inputs)
+                    return self.execute_function(p, [transformed])
+                self.functions[fid] = nested_fn
         
         elif comp_type == 'parallel':
             # Rebuild parallel composition: tertiary(primary(inputs), secondary(inputs))
@@ -128,13 +141,17 @@ class SymbolicRegistry:
         return loop_fn
 
     def _initialize_primitives(self):
-        """Register primitive bitwise operations on integers."""
-        # Define primitives to accept inputs as a list
+        """Register minimal primitive set for Turing completeness."""
+        # Bitwise operations (for bit manipulation)
         self.register("OR", lambda inputs: inputs[0] | inputs[1], arity=2)
         self.register("AND", lambda inputs: inputs[0] & inputs[1], arity=2)
         self.register("NOT", lambda inputs: ~inputs[0], arity=1)
         
-        # Register LOOP meta-function
+        # Arithmetic primitives (successor and predecessor)
+        self.register("INC", lambda inputs: inputs[0] + 1, arity=1)
+        self.register("DEC", lambda inputs: inputs[0] - 1, arity=1)
+        
+        # Meta-function for iteration (higher-order)
         self.loop_id = self.register("LOOP", None, arity=-1)
 
     def register(self, name: str, func: Callable, arity: int, layer: int = -1) -> int:

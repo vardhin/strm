@@ -12,13 +12,15 @@ class CurriculumGenerator:
         self.or_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'OR')
         self.and_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'AND')
         self.not_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'NOT')
+        self.inc_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'INC')
+        self.dec_id = next(fid for fid, m in registry.metadata.items() if m['name'] == 'DEC')
         self.loop_id = registry.loop_id
     
     def generate_curriculum(self) -> List[Dict]:
         """Generate curriculum of tasks with increasing complexity."""
         tasks = []
         
-        # Level 1: Identity tasks (learn single operations only)
+        # Level 1: Identity tasks (learn single operations)
         tasks.append({
             'name': 'OR_identity',
             'examples': [([2, 3], 2|3), ([1, 4], 1|4), ([0, 7], 0|7), ([5, 5], 5|5)],
@@ -37,6 +39,20 @@ class CurriculumGenerator:
             'name': 'NOT_identity',
             'examples': [([0], ~0), ([1], ~1), ([5], ~5), ([7], ~7)],
             'target': {'primary_id': self.not_id, 'secondary_id': None, 
+                       'comp_type': 'none', 'loop_count': 1}
+        })
+        
+        tasks.append({
+            'name': 'INC_identity',
+            'examples': [([0], 1), ([1], 2), ([5], 6), ([10], 11)],
+            'target': {'primary_id': self.inc_id, 'secondary_id': None, 
+                       'comp_type': 'none', 'loop_count': 1}
+        })
+        
+        tasks.append({
+            'name': 'DEC_identity',
+            'examples': [([1], 0), ([2], 1), ([6], 5), ([11], 10)],
+            'target': {'primary_id': self.dec_id, 'secondary_id': None, 
                        'comp_type': 'none', 'loop_count': 1}
         })
         
