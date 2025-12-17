@@ -29,11 +29,165 @@ class SymbolicRegistry:
         inc_id = self.register("INC", lambda inputs: inputs[0] + 1, arity=1)
         dec_id = self.register("DEC", lambda inputs: inputs[0] - 1, arity=1)
         
-        # Meta-function for iteration (higher-order)
-        self.loop_id = self.register("LOOP", None, arity=-1)
+        # Comparison primitives (for conditionals)
+        lt_id = self.register("LT", lambda inputs: 1 if inputs[0] < inputs[1] else 0, arity=2)
+        lte_id = self.register("LTE", lambda inputs: 1 if inputs[0] <= inputs[1] else 0, arity=2)
+        gt_id = self.register("GT", lambda inputs: 1 if inputs[0] > inputs[1] else 0, arity=2)
+        gte_id = self.register("GTE", lambda inputs: 1 if inputs[0] >= inputs[1] else 0, arity=2)
+        eq_id = self.register("EQ", lambda inputs: 1 if inputs[0] == inputs[1] else 0, arity=2)
+        neq_id = self.register("NEQ", lambda inputs: 1 if inputs[0] != inputs[1] else 0, arity=2)
+        
+        # Conditional primitive (if-then-else)
+        def cond_impl(inputs):
+            """COND(condition, then_value, else_value) - ternary operator"""
+            if len(inputs) != 3:
+                raise ValueError(f"COND expects 3 args [cond, then, else], got {len(inputs)}")
+            return inputs[1] if inputs[0] != 0 else inputs[2]
+        
+        cond_id = self.register("COND", cond_impl, arity=3)
+        
+        # Constant/Identity primitive (for representing constants)
+        const_id = self.register("CONST", lambda inputs: inputs[0], arity=1)
+        
+        # Enhanced LOOP: Can take function IDs or evaluate compositions dynamically
+        def loop_impl(inputs):
+            """
+            LOOP(body_expr, count_expr, *args)
+            
+            Three modes:
+            1. LOOP(func_id, count, init) - original: apply func 'count' times
+            2. LOOP(body_composition, count_composition, arg1, arg2, ...) - dynamic evaluation
+            
+            Example: LOOP(ADD(2,3), ADD(1,2)) for MUL
+              - Evaluates ADD(2,3) = 5 (value to add each iteration)
+              - Evaluates ADD(1,2) = 3 (number of iterations)
+              - Returns: 5 + 5 + 5 = 15 (accumulator starts at 0)
+            """
+            if len(inputs) < 2:
+                raise ValueError(f"LOOP expects at least 2 args, got {len(inputs)}")
+            
+            body_expr = inputs[0]
+            count_expr = inputs[1]
+            remaining_args = inputs[2:] if len(inputs) > 2 else []
+            
+            # Case 1: Traditional LOOP(func_id, count, init)
+            if len(inputs) == 3 and isinstance(body_expr, int) and isinstance(count_expr, int):
+                func_id = body_expr
+                count = count_expr
+                init_value = remaining_args[0]
+                
+                result = init_value
+                for _ in range(count):
+                    result = self.execute_function(func_id, [result])
+                
+                return result
+            
+            # Case 2: Dynamic evaluation LOOP(body_composition, count_composition, args...)
+            # Body and count are actually compositions or function calls
+            # We need to evaluate them with the provided arguments
+            
+            # If body_expr is a function ID, evaluate it with remaining args
+            if isinstance(body_expr, int) and body_expr in self.functions:
+                # This is a function ID - execute it
+                if len(remaining_args) >= self.metadata[body_expr]['arity']:
+                    body_arity = self.metadata[body_expr]['arity']
+                    body_args = remaining_args[:body_arity]
+                    body_value = self.execute_function(body_expr, body_args)
+                else:
+                    # Not enough args, treat as the value itself
+                    body_value = body_expr
+            else:
+                # It's already a value
+                body_value = body_expr
+            
+            # Same for count
+            if isinstance(count_expr, int) and count_expr in self.functions:
+                if len(remaining_args) >= self.metadata[count_expr]['arity']:
+                    count_arity = self.metadata[count_expr]['arity']
+                    # Use different args if available, otherwise reuse
+                    count_start = len(remaining_args) - count_arity if len(remaining_args) > count_arity else 0
+                    count_args = remaining_args[count_start:count_start + count_arity]
+                    count_value = self.execute_function(count_expr, count_args)
+                else:
+                    count_value = count_expr
+            else:
+                count_value = count_expr
+            
+            # Now perform the loop: accumulate body_value, count_value times
+            accumulator = 0
+            for _ in range(count_value):
+                accumulator += body_value
+            
+            return accumulator
+        
+        self.loop_id = self.register("LOOP", loop_impl, arity=-1)
+        
+        # Conditional loop (while loop)
+        def while_impl(inputs):
+            """
+            WHILE(cond_fn_id, body_fn_id, state, limit)
+            Execute body_fn(state) while cond_fn(state) != 0
+            Returns final state
+            """
+            if len(inputs) != 4:
+                raise ValueError(f"WHILE expects 4 args [cond_fn, body_fn, state, limit], got {len(inputs)}")
+            
+            cond_fn_id = inputs[0]
+            body_fn_id = inputs[1]
+            state = inputs[2]
+            limit = inputs[3]
+            
+            iterations = 0
+            while iterations < limit:
+                cond_result = self.execute_function(cond_fn_id, [state])
+                if cond_result == 0:  # Condition false
+                    break
+                state = self.execute_function(body_fn_id, [state])
+                iterations += 1
+            
+            return state
+        
+        while_id = self.register("WHILE", while_impl, arity=-1)
+        
+        # Accumulator (counting loop)
+        def accum_impl(inputs):
+            """
+            ACCUM(cond_fn_id, body_fn_id, state, counter, limit)
+            Like WHILE but returns counter (number of iterations)
+            Used for operations like division (counting subtractions)
+            """
+            if len(inputs) != 5:
+                raise ValueError(f"ACCUM expects 5 args [cond_fn, body_fn, state, counter, limit], got {len(inputs)}")
+            
+            cond_fn_id = inputs[0]
+            body_fn_id = inputs[1]
+            state = inputs[2]
+            counter = inputs[3]
+            limit = inputs[4]
+            
+            iterations = 0
+            while iterations < limit:
+                cond_result = self.execute_function(cond_fn_id, [state])
+                if cond_result == 0:  # Condition false
+                    break
+                state = self.execute_function(body_fn_id, [state])
+                counter += 1
+                iterations += 1
+            
+            return counter
+        
+        accum_id = self.register("ACCUM", accum_impl, arity=-1)
         
         # Register all primitives to DB
-        for fid in [or_id, and_id, not_id, inc_id, dec_id, self.loop_id]:
+        primitive_ids = [
+            or_id, and_id, not_id,
+            inc_id, dec_id,
+            lt_id, lte_id, gt_id, gte_id, eq_id, neq_id,
+            cond_id, const_id,
+            self.loop_id, while_id, accum_id
+        ]
+        
+        for fid in primitive_ids:
             meta = self.metadata[fid]
             self.db.add_primitive(fid, meta['name'], meta['arity'])
 
@@ -65,29 +219,48 @@ class SymbolicRegistry:
             for func_id, args in composition:
                 # Special handling for LOOP
                 if func_id == self.loop_id:
-                    # LOOP expects: [body_fn_id, count, init_value]
-                    # args = [body_fn_id, count_idx, init_idx]
-                    if len(args) != 3:
-                        raise ValueError(f"LOOP expects 3 args [fn_id, count_idx, init_idx], got {len(args)}")
+                    # Two modes based on number of args:
+                    # 1. LOOP with 3 args: [body_fn_id, count_idx, init_idx] - traditional
+                    # 2. LOOP with 2 args: [body_idx, count_idx] - dynamic (for MUL)
                     
-                    body_fn_id = args[0]  # This is a direct function ID
-                    count_idx = args[1]    # This is an index into available_values
-                    init_idx = args[2]     # This is an index into available_values
+                    if len(args) == 2:
+                        # Dynamic mode: LOOP(body_fn, count_fn, *original_inputs)
+                        body_idx = args[0]
+                        count_idx = args[1]
+                        
+                        if body_idx >= len(available_values) or count_idx >= len(available_values):
+                            raise ValueError(f"LOOP arg indices out of range: body_idx={body_idx}, count_idx={count_idx}, have {len(available_values)} values")
+                        
+                        # Get the function IDs or values
+                        body_fn_or_val = available_values[body_idx]
+                        count_fn_or_val = available_values[count_idx]
+                        
+                        # Call LOOP with these + original inputs for evaluation
+                        # LOOP will evaluate them and accumulate
+                        result = self.execute_function(func_id, [body_fn_or_val, count_fn_or_val] + list(inputs))
+                        available_values.append(result)
                     
-                    if count_idx >= len(available_values) or init_idx >= len(available_values):
-                        raise ValueError(f"LOOP arg indices out of range: count_idx={count_idx}, init_idx={init_idx}, have {len(available_values)} values")
-                    
-                    count = available_values[count_idx]
-                    init_value = available_values[init_idx]
-                    
-                    # Execute LOOP
-                    result = self.execute_function(func_id, [body_fn_id, count, init_value])
-                    available_values.append(result)
+                    elif len(args) == 3:
+                        # Traditional mode: LOOP(body_fn_id, count, init_value)
+                        body_fn_id = args[0]  # This is a direct function ID
+                        count_idx = args[1]    # This is an index into available_values
+                        init_idx = args[2]     # This is an index into available_values
+                        
+                        if count_idx >= len(available_values) or init_idx >= len(available_values):
+                            raise ValueError(f"LOOP arg indices out of range: count_idx={count_idx}, init_idx={init_idx}, have {len(available_values)} values")
+                        
+                        count = available_values[count_idx]
+                        init_value = available_values[init_idx]
+                        
+                        # Execute LOOP
+                        result = self.execute_function(func_id, [body_fn_id, count, init_value])
+                        available_values.append(result)
+                    else:
+                        raise ValueError(f"LOOP expects 2 or 3 args, got {len(args)}")
                 
                 # Special handling for LOOP with encoded function ID (nested LOOP)
                 elif func_id == self.loop_id and len(args) > 0 and args[0] < 0:
                     # This is LOOP with a learned function
-                    # args = [encoded_func_id, start_input_idx, count_input_idx]
                     from .executor import ProgramExecutor
                     executor = ProgramExecutor(self)
                     
@@ -204,85 +377,187 @@ class SymbolicRegistry:
             self.functions[fid] = lambda inputs: inputs[0] + 1
         elif name == 'DEC':
             self.functions[fid] = lambda inputs: inputs[0] - 1
+        elif name == 'LT':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] < inputs[1] else 0
+        elif name == 'LTE':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] <= inputs[1] else 0
+        elif name == 'GT':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] > inputs[1] else 0
+        elif name == 'GTE':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] >= inputs[1] else 0
+        elif name == 'EQ':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] == inputs[1] else 0
+        elif name == 'NEQ':
+            self.functions[fid] = lambda inputs: 1 if inputs[0] != inputs[1] else 0
+        elif name == 'COND':
+            self.functions[fid] = lambda inputs: inputs[1] if inputs[0] != 0 else inputs[2]
+        elif name == 'CONST':
+            self.functions[fid] = lambda inputs: inputs[0]
         elif name == 'LOOP':
             self.loop_id = fid
-            # LOOP implementation: applies a function repeatedly
-            # Expects: [func_id, count, init_value]
             def loop_impl(inputs):
-                if len(inputs) != 3:
-                    raise ValueError(f"LOOP expects 3 args [func_id, count, init], got {len(inputs)}")
+                if len(inputs) < 2:
+                    raise ValueError(f"LOOP expects at least 2 args, got {len(inputs)}")
                 
-                func_id = inputs[0]
-                count = inputs[1]
-                init_value = inputs[2]
+                body_expr = inputs[0]
+                count_expr = inputs[1]
+                remaining_args = inputs[2:] if len(inputs) > 2 else []
                 
-                result = init_value
-                for _ in range(count):
-                    result = self.execute_function(func_id, [result])
+                # Traditional mode: LOOP(func_id, count, init)
+                if len(inputs) == 3 and isinstance(body_expr, int) and isinstance(count_expr, int):
+                    func_id = body_expr
+                    count = count_expr
+                    init_value = remaining_args[0]
+                    
+                    result = init_value
+                    for _ in range(count):
+                        result = self.execute_function(func_id, [result])
+                    
+                    return result
                 
-                return result
+                # Dynamic evaluation mode
+                if isinstance(body_expr, int) and body_expr in self.functions:
+                    if len(remaining_args) >= self.metadata[body_expr]['arity']:
+                        body_arity = self.metadata[body_expr]['arity']
+                        body_args = remaining_args[:body_arity]
+                        body_value = self.execute_function(body_expr, body_args)
+                    else:
+                        body_value = body_expr
+                else:
+                    body_value = body_expr
+                
+                if isinstance(count_expr, int) and count_expr in self.functions:
+                    if len(remaining_args) >= self.metadata[count_expr]['arity']:
+                        count_arity = self.metadata[count_expr]['arity']
+                        count_start = len(remaining_args) - count_arity if len(remaining_args) > count_arity else 0
+                        count_args = remaining_args[count_start:count_start + count_arity]
+                        count_value = self.execute_function(count_expr, count_args)
+                    else:
+                        count_value = count_expr
+                else:
+                    count_value = count_expr
+                
+                # Accumulate
+                accumulator = 0
+                for _ in range(count_value):
+                    accumulator += body_value
+                
+                return accumulator
             
             self.functions[fid] = loop_impl
+        elif name == 'WHILE':
+            def while_impl(inputs):
+                if len(inputs) != 4:
+                    raise ValueError(f"WHILE expects 4 args [cond_fn, body_fn, state, limit], got {len(inputs)}")
+                cond_fn_id = inputs[0]
+                body_fn_id = inputs[1]
+                state = inputs[2]
+                limit = inputs[3]
+                iterations = 0
+                while iterations < limit:
+                    cond_result = self.execute_function(cond_fn_id, [state])
+                    if cond_result == 0:
+                        break
+                    state = self.execute_function(body_fn_id, [state])
+                    iterations += 1
+                return state
+            self.functions[fid] = while_impl
+        elif name == 'ACCUM':
+            def accum_impl(inputs):
+                if len(inputs) != 5:
+                    raise ValueError(f"ACCUM expects 5 args [cond_fn, body_fn, state, counter, limit], got {len(inputs)}")
+                cond_fn_id = inputs[0]
+                body_fn_id = inputs[1]
+                state = inputs[2]
+                counter = inputs[3]
+                limit = inputs[4]
+                iterations = 0
+                while iterations < limit:
+                    cond_result = self.execute_function(cond_fn_id, [state])
+                    if cond_result == 0:
+                        break
+                    state = self.execute_function(body_fn_id, [state])
+                    counter += 1
+                    iterations += 1
+                return counter
+            self.functions[fid] = accum_impl
         else:
             raise ValueError(f"Unknown primitive function: {name}")
     
     def _rebuild_composition(self, fid: int, composition: List[Tuple[int, List[int]]]):
         """Rebuild a composed function from DB data."""
         def composed_fn(inputs, comp=composition):
-            # Start with original inputs as a list
             available_values = list(inputs) if isinstance(inputs, list) else [inputs]
             
-            # Execute each function in the composition
-            for child_id, arg_indices in comp:
-                # Get the child function's metadata
-                child_meta = self.metadata[child_id]
-                child_arity = child_meta['arity']
-                
-                # Build child inputs by mapping indices to available values
-                child_inputs = []
-                for idx in arg_indices:
-                    # Negative indices encode literal function IDs
-                    if idx < 0:
-                        # Decode: idx = -func_id-1, so func_id = -idx-1
-                        func_id = -idx - 1
-                        child_inputs.append(func_id)
-                    elif idx < len(available_values):
-                        child_inputs.append(available_values[idx])
+            for func_id, args in comp:
+                # Special handling for LOOP
+                if func_id == self.loop_id:
+                    # Two modes based on number of args:
+                    # 1. LOOP with 3 args: [body_fn_id, count_idx, init_idx] - traditional
+                    # 2. LOOP with 2 args: [body_idx, count_idx] - dynamic (for MUL)
+                    
+                    if len(args) == 2:
+                        # Dynamic mode: LOOP(body_fn, count_fn, *original_inputs)
+                        body_idx = args[0]
+                        count_idx = args[1]
+                        
+                        if body_idx >= len(available_values) or count_idx >= len(available_values):
+                            raise ValueError(f"LOOP arg indices out of range: body_idx={body_idx}, count_idx={count_idx}, have {len(available_values)} values")
+                        
+                        # Get the function IDs or values
+                        body_fn_or_val = available_values[body_idx]
+                        count_fn_or_val = available_values[count_idx]
+                        
+                        # Call LOOP with these + original inputs for evaluation
+                        # LOOP will evaluate them and accumulate
+                        result = self.execute_function(func_id, [body_fn_or_val, count_fn_or_val] + list(inputs))
+                        available_values.append(result)
+                    
+                    elif len(args) == 3:
+                        # Traditional mode: LOOP(body_fn_id, count, init_value)
+                        body_fn_id = args[0]  # This is a direct function ID
+                        count_idx = args[1]    # This is an index into available_values
+                        init_idx = args[2]     # This is an index into available_values
+                        
+                        if count_idx >= len(available_values) or init_idx >= len(available_values):
+                            raise ValueError(f"LOOP arg indices out of range: count_idx={count_idx}, init_idx={init_idx}, have {len(available_values)} values")
+                        
+                        count = available_values[count_idx]
+                        init_value = available_values[init_idx]
+                        
+                        # Execute LOOP
+                        result = self.execute_function(func_id, [body_fn_id, count, init_value])
+                        available_values.append(result)
                     else:
-                        raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
+                        raise ValueError(f"LOOP expects 2 or 3 args, got {len(args)}")
                 
-                # Special handling for LOOP (arity=-1)
-                if child_id == self.loop_id and child_meta['name'] == 'LOOP':
-                    if len(child_inputs) != 3:
-                        raise ValueError(f"LOOP expects 3 args: (func_id, start, count), got {len(child_inputs)}")
+                # Special handling for LOOP with encoded function ID (nested LOOP)
+                elif func_id == self.loop_id and len(args) > 0 and args[0] < 0:
+                    # This is LOOP with a learned function
+                    from .executor import ProgramExecutor
+                    executor = ProgramExecutor(self)
                     
-                    # child_inputs = [func_id, start_value, count]
-                    loop_func_id = child_inputs[0]
-                    start_value = child_inputs[1]
-                    count = child_inputs[2]
+                    # Extract the function ID from encoding
+                    loop_func_id = -(args[0] + 1)
                     
-                    # Apply the function 'count' times
-                    result = start_value
-                    for _ in range(count):
-                        result = self.execute_function(loop_func_id, [result])
-                
-                # Normal function execution
-                elif child_arity != -1:
-                    # Ensure we have the right number of arguments
-                    if len(child_inputs) != child_arity:
-                        raise ValueError(f"Function {child_meta['name']} expects {child_arity} args, got {len(child_inputs)}")
+                    # Get the actual input values for the loop
+                    loop_inputs = [available_values[args[i]] for i in range(1, len(args))]
                     
-                    # Execute the child function
-                    result = self.execute_function(child_id, child_inputs)
+                    # Execute loop with dynamic count (-1)
+                    result = executor._execute_loop(loop_func_id, loop_inputs, loop_count=-1)
+                    available_values.append(result)
                 
                 else:
-                    # Variable arity function (not LOOP) - just pass all args
-                    result = self.execute_function(child_id, child_inputs)
-                
-                # Add result to available values for next function
-                available_values.append(result)
+                    # Normal composition step
+                    step_inputs = []
+                    for idx in args:
+                        if idx < 0 or idx >= len(available_values):
+                            raise ValueError(f"Arg index {idx} out of range (have {len(available_values)} values)")
+                        step_inputs.append(available_values[idx])
+                    
+                    result = self.execute_function(func_id, step_inputs)
+                    available_values.append(result)
             
-            # Return the last computed value
             return available_values[-1]
         
         self.functions[fid] = composed_fn
