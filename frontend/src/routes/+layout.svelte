@@ -1,11 +1,25 @@
 <script>
-	import favicon from '$lib/assets/favicon.svg';
+    import Navbar from '$lib/components/Navbar.svelte';
+    import Toast from '$lib/components/Toast.svelte';
+    import '$lib/styles/global.css';
 
-	let { children } = $props();
+    let { children } = $props();
 </script>
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+    <title>NSSR</title>
 </svelte:head>
 
-{@render children()}
+<Navbar />
+<main>
+    {@render children()}
+</main>
+<Toast />
+
+<style>
+    main {
+        padding: 1.5rem;
+        max-width: 1200px;
+        margin: 0 auto;
+    }
+</style>
