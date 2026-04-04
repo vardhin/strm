@@ -86,11 +86,18 @@ def build_composition(candidate: dict, input_arity: int,
         ]
 
     if comp_type == "parallel":
-        # tertiary(primary(inputs), secondary(inputs))
-        comp = [
-            (pid, list(range(input_arity))),
-            (sid, list(range(input_arity))),
-        ]
+        # tertiary(primary(routed_inputs), secondary(routed_inputs))
+        routing = candidate.get("routing")
+        if routing:
+            comp = [
+                (pid, routing[0]),
+                (sid, routing[1]),
+            ]
+        else:
+            comp = [
+                (pid, list(range(input_arity))),
+                (sid, list(range(input_arity))),
+            ]
         if tid is not None:
             comp.append((tid, [input_arity, input_arity + 1]))
         return comp

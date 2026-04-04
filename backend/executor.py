@@ -44,24 +44,44 @@ def _run_base(state: dict, candidate: dict, inputs: list) -> Any:
     pid = candidate["primary_id"]
 
     if comp == "none":
+        routing = candidate.get("routing")
+        if routing:
+            inputs = [inputs[i] for i in routing[0]]
         return reg.execute(state, pid, inputs)
 
     sid = candidate["secondary_id"]
 
     if comp == "sequential":
-        intermediate = reg.execute(state, sid, inputs)
+        routing = candidate.get("routing")
+        if routing:
+            inp_s = [inputs[i] for i in routing[0]]
+        else:
+            inp_s = inputs
+        intermediate = reg.execute(state, sid, inp_s)
         return reg.execute(state, pid, [intermediate])
 
     if comp == "nested":
         # primary(secondary(x), secondary(y), ...)
-        transformed = [reg.execute(state, sid, [x]) for x in inputs]
+        routing = candidate.get("routing")
+        if routing:
+            items = [inputs[i] for i in routing[0]]
+        else:
+            items = inputs
+        transformed = [reg.execute(state, sid, [x]) for x in items]
         return reg.execute(state, pid, transformed)
 
     if comp == "parallel":
-        # tertiary(primary(inputs), secondary(inputs))
+        # tertiary(primary(routed_inputs), secondary(routed_inputs))
         tid = candidate.get("tertiary_id")
-        r1 = reg.execute(state, pid, inputs)
-        r2 = reg.execute(state, sid, inputs)
+        routing = candidate.get("routing")
+        if routing:
+            inp1 = [inputs[i] for i in routing[0]]
+            inp2 = [inputs[i] for i in routing[1]]
+        else:
+            inp1 = inputs
+            inp2 = inputs
+        r1 = reg.execute(state, pid, inp1)
+        r2 = reg.execute(state, sid, inp2)
         if tid is not None:
             return reg.execute(state, tid, [r1, r2])
         return r1

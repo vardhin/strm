@@ -9,6 +9,7 @@ Both return a candidate dict or None.
 """
 
 import math
+from itertools import combinations
 import torch
 from typing import Any
 
@@ -82,21 +83,45 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
     if max_depth < 3:
         return _try_fit_any(state, near_misses, examples)
 
-    # Depth 3: parallel with tertiary combiner
+    # Depth 3: parallel with tertiary combiner (with input routing)
     if input_arity >= 2:
         for pid in all_ids:
             if pid == loop_id:
                 continue
+            meta_p = state["metadata"].get(pid)
+            if meta_p is None:
+                continue
+            arity_p = meta_p["arity"]
+            if arity_p < 1:
+                continue
             for sid in all_ids:
                 if sid == loop_id:
+                    continue
+                meta_s = state["metadata"].get(sid)
+                if meta_s is None:
+                    continue
+                arity_s = meta_s["arity"]
+                if arity_s < 1:
                     continue
                 for tid in all_ids:
                     if tid == loop_id:
                         continue
-                    cand = _candidate(pid, sid, tid, comp_type="parallel")
-                    if exe.validate(state, cand, examples):
-                        return cand
-                    near_misses.append(cand)
+                    # Without routing (original behavior)
+                    if arity_p == input_arity and arity_s == input_arity:
+                        cand = _candidate(pid, sid, tid, comp_type="parallel")
+                        if exe.validate(state, cand, examples):
+                            return cand
+                        near_misses.append(cand)
+                    # With routing (new: sub-functions need fewer inputs)
+                    if arity_p <= input_arity and arity_s <= input_arity:
+                        for route_p, route_s in _generate_routings(
+                                input_arity, arity_p, arity_s):
+                            cand = _candidate(pid, sid, tid,
+                                              comp_type="parallel",
+                                              routing=[route_p, route_s])
+                            if exe.validate(state, cand, examples):
+                                return cand
+                            near_misses.append(cand)
 
     return _try_fit_any(state, near_misses, examples)
 
@@ -117,6 +142,7 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
     tried: set[tuple] = set()
     n_functions = reg.vocab_size(state)
     near_misses = []
+    input_arity = len(examples[0][0])
 
     for step in range(max_steps):
         carry, outputs = model(carry, x_input)
@@ -134,7 +160,8 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
         comp_top = torch.topk(comp_logits, min(len(COMP_TYPES), len(comp_logits))).indices
 
         # Generate and deduplicate candidates
-        candidates = _generate_candidates(state, tops, comp_top, max_depth)
+        candidates = _generate_candidates(state, tops, comp_top, max_depth,
+                                          input_arity)
 
         for cand in candidates:
             key = _cand_key(cand)
@@ -160,7 +187,7 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
 # ---------------------------------------------------------------------------
 
 def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
-                         max_depth: int) -> list[dict]:
+                         max_depth: int, input_arity: int = 2) -> list[dict]:
     """Build candidate dicts from top-k predictions at each depth."""
     candidates = []
     loop_id = state["loop_id"]
@@ -191,7 +218,9 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
                     for tid in tertiary_ids:
                         if tid == loop_id:
                             continue
-                        candidates.append(_candidate(pid, sid, tid, comp_type=comp))
+                        _add_parallel_candidates(
+                            candidates, state, pid, sid, tid,
+                            input_arity, comp)
                 else:
                     candidates.append(_candidate(pid, sid, comp_type=comp))
 
@@ -230,7 +259,9 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
                     if pid == loop_id:
                         continue
                     for tid in tertiary_ids:
-                        candidates.append(_candidate(lid, pid, tid, comp_type=comp))
+                        _add_parallel_candidates(
+                            candidates, state, lid, pid, tid,
+                            input_arity, comp)
             else:
                 for pid in primary_ids:
                     if pid == loop_id:
@@ -238,6 +269,30 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
                     candidates.append(_candidate(pid, lid, comp_type=comp))
 
     return candidates
+
+
+def _add_parallel_candidates(candidates: list, state: dict,
+                             pid: int, sid: int, tid: int,
+                             input_arity: int, comp: str):
+    """Add parallel candidates with routing when sub-functions need fewer inputs."""
+    meta_p = state["metadata"].get(pid)
+    meta_s = state["metadata"].get(sid)
+    if meta_p is None or meta_s is None:
+        return
+
+    arity_p = meta_p["arity"]
+    arity_s = meta_s["arity"]
+
+    # Both match input arity exactly — no routing needed
+    if arity_p == input_arity and arity_s == input_arity:
+        candidates.append(_candidate(pid, sid, tid, comp_type=comp))
+        return
+
+    # Need routing: sub-functions take fewer inputs than available
+    if 0 < arity_p <= input_arity and 0 < arity_s <= input_arity:
+        for route_p, route_s in _generate_routings(input_arity, arity_p, arity_s):
+            candidates.append(_candidate(pid, sid, tid, comp_type=comp,
+                                         routing=[route_p, route_s]))
 
 
 # ---------------------------------------------------------------------------
@@ -327,22 +382,50 @@ def _r2(actual: list[float], predicted: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Input routing
+# ---------------------------------------------------------------------------
+
+def _generate_routings(input_arity: int, arity_p: int, arity_s: int
+                       ) -> list[tuple[list[int], list[int]]]:
+    """Generate all ways to route `input_arity` inputs to two sub-functions.
+
+    Each routing is (indices_for_primary, indices_for_secondary).
+    Inputs can be shared between sub-functions (e.g. m goes to both KE and PE).
+    Only generates routings where both sub-functions get exactly the number
+    of inputs they need.
+    """
+    all_indices = list(range(input_arity))
+    routings = []
+
+    for combo_p in combinations(all_indices, arity_p):
+        for combo_s in combinations(all_indices, arity_s):
+            routings.append((list(combo_p), list(combo_s)))
+
+    return routings
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _candidate(primary_id: int, secondary_id: int | None = None,
                tertiary_id: int | None = None, *,
-               comp_type: str = "none") -> dict:
+               comp_type: str = "none",
+               routing: list[list[int]] | None = None) -> dict:
     return {
         "primary_id": primary_id,
         "secondary_id": secondary_id,
         "tertiary_id": tertiary_id,
         "comp_type": comp_type,
+        "routing": routing,
     }
 
 
 def _cand_key(c: dict) -> tuple:
-    return (c["primary_id"], c["secondary_id"], c.get("tertiary_id"), c["comp_type"])
+    routing = c.get("routing")
+    routing_key = tuple(tuple(r) for r in routing) if routing else None
+    return (c["primary_id"], c["secondary_id"], c.get("tertiary_id"),
+            c["comp_type"], routing_key)
 
 
 def format_examples(examples: list[tuple[list, Any]], *,
