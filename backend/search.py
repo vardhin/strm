@@ -8,6 +8,7 @@ Two strategies:
 Both return a candidate dict or None.
 """
 
+import math
 import torch
 from typing import Any
 
@@ -29,6 +30,7 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
     loop_id = state["loop_id"]
     all_ids = list(state["functions"].keys())
     input_arity = len(examples[0][0])
+    near_misses = []  # candidates to try constant-fitting on
 
     # Depth 1: single functions
     for fid in all_ids:
@@ -37,9 +39,10 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
         cand = _candidate(fid)
         if exe.validate(state, cand, examples):
             return cand
+        near_misses.append(cand)
 
     if max_depth < 2:
-        return None
+        return _try_fit_any(state, near_misses, examples)
 
     # Depth 2: two-function compositions
     for pid in all_ids:
@@ -52,6 +55,7 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
                 cand = _candidate(pid, sid, comp_type=comp)
                 if exe.validate(state, cand, examples):
                     return cand
+                near_misses.append(cand)
 
     # Depth 2: LOOP with unary body — LOOP(body_fn, count=b, init=a)
     if loop_id is not None:
@@ -76,7 +80,7 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
                     return cand
 
     if max_depth < 3:
-        return None
+        return _try_fit_any(state, near_misses, examples)
 
     # Depth 3: parallel with tertiary combiner
     if input_arity >= 2:
@@ -92,8 +96,9 @@ def exhaustive(state: dict, examples: list[tuple[list[int], Any]],
                     cand = _candidate(pid, sid, tid, comp_type="parallel")
                     if exe.validate(state, cand, examples):
                         return cand
+                    near_misses.append(cand)
 
-    return None
+    return _try_fit_any(state, near_misses, examples)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +116,7 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
 
     tried: set[tuple] = set()
     n_functions = reg.vocab_size(state)
+    near_misses = []
 
     for step in range(max_steps):
         carry, outputs = model(carry, x_input)
@@ -138,13 +144,15 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
 
             if exe.validate(state, cand, examples):
                 return cand
+            near_misses.append(cand)
 
         # Small noise on carry for exploration
         with torch.no_grad():
             carry.y = carry.y + torch.randn_like(carry.y) * 0.01
             carry.z = carry.z + torch.randn_like(carry.z) * 0.01
 
-    return None
+    # No exact match found — try fitting constants on all near misses
+    return _try_fit_any(state, near_misses, examples)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +241,92 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
+# Constant fitting
+# ---------------------------------------------------------------------------
+
+def _try_fit_constants(state: dict, cand: dict,
+                       examples: list[tuple[list, Any]],
+                       r2_threshold: float = 0.999) -> dict | None:
+    """Try fitting a single multiplicative constant into a candidate.
+
+    For each composition type, we compute what the candidate produces WITHOUT
+    a constant, then solve for k such that k * produced = expected.
+    Returns a new candidate dict with 'constants' field if successful.
+    """
+    comp = cand["comp_type"]
+    pid = cand["primary_id"]
+
+    # Collect (produced, expected) pairs by running the candidate as-is
+    produced = []
+    expected = []
+    for inputs, exp in examples:
+        try:
+            got = exe.run(state, cand, inputs)
+            produced.append(float(got))
+            expected.append(float(exp))
+        except Exception:
+            return None
+
+    if not produced:
+        return None
+
+    # Try fitting k: expected = k * produced
+    k = _fit_scale(produced, expected)
+    if k is not None:
+        r2 = _r2(expected, [k * p for p in produced])
+        if r2 > r2_threshold:
+            return {**cand, "constants": [k]}
+
+    # Try fitting additive: expected = produced + k
+    k = _fit_offset(produced, expected)
+    if k is not None:
+        r2 = _r2(expected, [p + k for p in produced])
+        if r2 > r2_threshold:
+            return {**cand, "constants": [k], "const_mode": "additive"}
+
+    return None
+
+
+def _try_fit_any(state: dict, candidates: list[dict],
+                  examples: list[tuple[list, Any]]) -> dict | None:
+    """Try constant-fitting on a list of candidates. Return best match or None."""
+    for cand in candidates:
+        fitted = _try_fit_constants(state, cand, examples)
+        if fitted is not None:
+            return fitted
+    return None
+
+
+def _fit_scale(produced: list[float], expected: list[float]) -> float | None:
+    """Solve for k in expected = k * produced (least squares)."""
+    num = sum(p * e for p, e in zip(produced, expected))
+    den = sum(p * p for p in produced)
+    if abs(den) < 1e-15:
+        return None
+    return num / den
+
+
+def _fit_offset(produced: list[float], expected: list[float]) -> float | None:
+    """Solve for k in expected = produced + k."""
+    diffs = [e - p for e, p in zip(produced, expected)]
+    mean_diff = sum(diffs) / len(diffs)
+    # Check consistency: all diffs should be ~equal
+    if all(abs(d - mean_diff) < 1e-6 for d in diffs):
+        return mean_diff
+    return None
+
+
+def _r2(actual: list[float], predicted: list[float]) -> float:
+    """Compute R² score."""
+    mean_a = sum(actual) / len(actual)
+    ss_res = sum((a - p) ** 2 for a, p in zip(actual, predicted))
+    ss_tot = sum((a - mean_a) ** 2 for a in actual)
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else -float("inf")
+    return 1.0 - ss_res / ss_tot
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -251,9 +345,14 @@ def _cand_key(c: dict) -> tuple:
     return (c["primary_id"], c["secondary_id"], c.get("tertiary_id"), c["comp_type"])
 
 
-def format_examples(examples: list[tuple[list[int], Any]], *,
+def format_examples(examples: list[tuple[list, Any]], *,
                     input_dim: int, seq_len: int) -> torch.Tensor:
-    """Encode examples as bit vectors for the TRM.
+    """Encode examples as float vectors for the TRM.
+
+    Each input value is placed at position 0 of its input_dim-sized slot,
+    with a magnitude encoding spread across a few additional dimensions
+    for richer signal. This replaces the old bit-vector encoding and
+    supports arbitrary float inputs.
 
     Returns: (batch_size, seq_len, input_dim) float tensor.
     """
@@ -262,10 +361,15 @@ def format_examples(examples: list[tuple[list[int], Any]], *,
 
     for b, (inputs, _) in enumerate(examples):
         for pos in range(min(len(inputs), seq_len)):
-            val = inputs[pos]
-            if val < 0:
-                val = (1 << input_dim) + val
-            for bit in range(input_dim):
-                data[b, pos, bit] = float((val >> bit) & 1)
+            val = float(inputs[pos])
+            # Channel 0: raw value (normalized loosely — values typically < 1000)
+            data[b, pos, 0] = val / 100.0
+            # Channel 1: sign
+            data[b, pos, 1] = 1.0 if val >= 0 else -1.0
+            # Channel 2: log-magnitude (for scale awareness)
+            data[b, pos, 2] = torch.log1p(torch.tensor(abs(val))).item()
+            # Channel 3: fractional part (distinguishes 2.5 from 2.0)
+            data[b, pos, 3] = val - int(val) if val >= 0 else -(abs(val) - int(abs(val)))
+            # Channels 4+: leave as zero padding
 
     return data

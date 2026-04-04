@@ -9,6 +9,7 @@ Strategies (tried in order):
   2. Prune redundant intermediate steps
 """
 
+import math
 from typing import Any
 
 import registry as reg
@@ -19,17 +20,21 @@ import registry as reg
 # ---------------------------------------------------------------------------
 
 def simplify(state: dict, composition: list[tuple[int, list[int]]],
-             examples: list[tuple[list[int], Any]]) -> list[tuple[int, list[int]]]:
+             examples: list[tuple[list[int], Any]],
+             constants: list[float] | None = None,
+             const_mode: str = "multiplicative") -> list[tuple[int, list[int]]]:
     """Return the simplest equivalent composition."""
     best = composition
 
-    # Strategy 1: single existing function
-    single = _try_single_function(state, examples)
-    if single is not None and _complexity(state, single) < _complexity(state, best):
-        return single
+    # Strategy 1: single existing function (only if no constants — constants
+    # make the function unique even if the base composition matches)
+    if not constants:
+        single = _try_single_function(state, examples)
+        if single is not None and _complexity(state, single) < _complexity(state, best):
+            return single
 
     # Strategy 2: prune redundant steps
-    pruned = _try_prune(state, best, examples)
+    pruned = _try_prune(state, best, examples, constants, const_mode)
     if pruned is not None and _complexity(state, pruned) < _complexity(state, best):
         best = pruned
 
@@ -51,7 +56,8 @@ def _try_single_function(state: dict, examples: list[tuple[list[int], Any]],
         if meta["arity"] != input_arity:
             continue
         try:
-            if all(reg.execute(state, fid, inp) == exp for inp, exp in examples):
+            if all(math.isclose(reg.execute(state, fid, inp), exp, rel_tol=1e-6, abs_tol=1e-9)
+                   for inp, exp in examples):
                 return [(fid, list(range(input_arity)))]
         except Exception:
             continue
@@ -65,6 +71,8 @@ def _try_single_function(state: dict, examples: list[tuple[list[int], Any]],
 
 def _try_prune(state: dict, composition: list[tuple[int, list[int]]],
                examples: list[tuple[list[int], Any]],
+               constants: list[float] | None = None,
+               const_mode: str = "multiplicative",
                ) -> list[tuple[int, list[int]]] | None:
     """Try removing each non-final step. Return first shorter form that works."""
     if len(composition) <= 1:
@@ -98,7 +106,7 @@ def _try_prune(state: dict, composition: list[tuple[int, list[int]]],
         if not valid:
             continue
 
-        if _validate(state, shortened, examples):
+        if _validate(state, shortened, examples, constants, const_mode):
             return shortened
 
     return None
@@ -109,7 +117,9 @@ def _try_prune(state: dict, composition: list[tuple[int, list[int]]],
 # ---------------------------------------------------------------------------
 
 def _validate(state: dict, composition: list[tuple[int, list[int]]],
-              examples: list[tuple[list[int], Any]]) -> bool:
+              examples: list[tuple[list[int], Any]],
+              constants: list[float] | None = None,
+              const_mode: str = "multiplicative") -> bool:
     """Test a composition against all examples by running step-by-step."""
     for inputs, expected in examples:
         try:
@@ -118,7 +128,13 @@ def _validate(state: dict, composition: list[tuple[int, list[int]]],
                 step_inputs = [available[i] for i in args]
                 result = reg.execute(state, child_id, step_inputs)
                 available.append(result)
-            if available[-1] != expected:
+            result = available[-1]
+            if constants:
+                if const_mode == "additive":
+                    result = result + constants[0]
+                else:
+                    result = result * constants[0]
+            if not math.isclose(result, expected, rel_tol=1e-6, abs_tol=1e-9):
                 return False
         except Exception:
             return False

@@ -104,12 +104,12 @@ def build_composition(candidate: dict, input_arity: int,
 
 def learn(conn: sqlite3.Connection, state: dict, model: TRM,
           optimizer: torch.optim.Optimizer, name: str,
-          examples: list[tuple[list[int], int]], *,
+          examples: list[tuple[list, float | int]], *,
           max_search_steps: int = 10, max_depth: int = 3,
-          num_epochs: int = 30) -> tuple[bool, torch.optim.Optimizer]:
+          num_epochs: int = 30) -> tuple[bool, torch.optim.Optimizer, float]:
     """Full pipeline: search -> simplify -> register -> resize -> train.
 
-    Returns (success, optimizer) — optimizer may be recreated after resize.
+    Returns (success, optimizer, r2_score).
     """
     input_dim = CONFIG["input_dim"]
     seq_len = CONFIG["seq_len"]
@@ -127,18 +127,24 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
 
     if candidate is None:
         print(f"  could not find composition for {name}")
-        return False, optimizer
+        return False, optimizer, 0.0
 
-    print(f"  found: {_fmt_candidate(state, candidate)}")
+    constants = candidate.get("constants")
+    const_mode = candidate.get("const_mode", "multiplicative")
+    if constants:
+        print(f"  found: {_fmt_candidate(state, candidate)}  (k={constants[0]}, {const_mode})")
+    else:
+        print(f"  found: {_fmt_candidate(state, candidate)}")
 
     # Phase 2: simplify
     input_arity = len(examples[0][0])
     composition = build_composition(candidate, input_arity, state["loop_id"])
-    composition = simplify.simplify(state, composition, examples)
+    composition = simplify.simplify(state, composition, examples, constants, const_mode)
 
     # Phase 3: register
     old_vocab = reg.vocab_size(state)
-    fid = reg.register_learned(conn, state, name, input_arity, composition)
+    fid = reg.register_learned(conn, state, name, input_arity, composition,
+                               constants, const_mode)
     new_vocab = reg.vocab_size(state)
     print(f"  registered {name} as id={fid}")
 
@@ -153,10 +159,11 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
                             input_dim=input_dim, seq_len=seq_len,
                             num_epochs=num_epochs, n_sup=CONFIG["n_sup"])
 
-    # Verify
-    ok = all(reg.execute(state, fid, inp) == exp for inp, exp in examples)
-    print(f"  verification: {'passed' if ok else 'FAILED'}")
-    return ok, optimizer
+    # Verify (R² score)
+    r2 = exe.r_squared(state, fid, examples)
+    ok = r2 > 0.999
+    print(f"  verification: R²={r2:.6f} ({'passed' if ok else 'FAILED'})")
+    return ok, optimizer, r2
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +328,8 @@ def main():
     for name, examples in TARGETS:
         depth = 3 if name in ("XOR", "MUL") else 2
         epochs = 50 if name in ("XOR", "MUL") else 30
-        _, optimizer = learn(conn, state, model, optimizer, name, examples,
-                             max_depth=depth, num_epochs=epochs)
+        _, optimizer, _ = learn(conn, state, model, optimizer, name, examples,
+                                max_depth=depth, num_epochs=epochs)
 
     # Save
     save_checkpoint(model, optimizer, state)

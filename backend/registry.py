@@ -47,6 +47,9 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         "INC":   (1, _factory(lambda inp: inp[0] + 1)),
         "DEC":   (1, _factory(lambda inp: inp[0] - 1)),
 
+        # -- Division (float) --
+        "DIV":   (2, _factory(lambda inp: inp[0] / inp[1] if inp[1] != 0 else 0.0)),
+
         # -- Comparison --
         "LT":    (2, _factory(lambda inp: int(inp[0] < inp[1]))),
         "LTE":   (2, _factory(lambda inp: int(inp[0] <= inp[1]))),
@@ -79,10 +82,10 @@ def _loop_factory(execute_fn):
     def loop_impl(inputs):
         if len(inputs) < 3:
             raise ValueError(f"LOOP expects 3-4 args [body_fn_id, count, init, (step_arg)], got {len(inputs)}")
-        body_fn_id, count, init_value = inputs[0], inputs[1], inputs[2]
+        body_fn_id, count, init_value = int(inputs[0]), inputs[1], inputs[2]
         step_arg = inputs[3] if len(inputs) >= 4 else None
         result = init_value
-        for _ in range(count):
+        for _ in range(int(count)):
             if step_arg is not None:
                 result = execute_fn(body_fn_id, [result, step_arg])
             else:
@@ -96,8 +99,8 @@ def _while_factory(execute_fn):
     def while_impl(inputs):
         if len(inputs) != 4:
             raise ValueError(f"WHILE expects 4 args [cond_fn, body_fn, state, limit], got {len(inputs)}")
-        cond_fn_id, body_fn_id, state, limit = inputs
-        for _ in range(limit):
+        cond_fn_id, body_fn_id, state, limit = int(inputs[0]), int(inputs[1]), inputs[2], inputs[3]
+        for _ in range(int(limit)):
             if execute_fn(cond_fn_id, [state]) == 0:
                 break
             state = execute_fn(body_fn_id, [state])
@@ -110,8 +113,9 @@ def _accum_factory(execute_fn):
     def accum_impl(inputs):
         if len(inputs) != 5:
             raise ValueError(f"ACCUM expects 5 args [cond_fn, body_fn, state, counter, limit], got {len(inputs)}")
-        cond_fn_id, body_fn_id, state, counter, limit = inputs
-        for _ in range(limit):
+        cond_fn_id, body_fn_id = int(inputs[0]), int(inputs[1])
+        state, counter, limit = inputs[2], inputs[3], inputs[4]
+        for _ in range(int(limit)):
             if execute_fn(cond_fn_id, [state]) == 0:
                 break
             state = execute_fn(body_fn_id, [state])
@@ -192,7 +196,12 @@ def load_registry(conn: sqlite3.Connection) -> dict:
         else:
             # Learned — build a composition closure
             composition = db.get_composition(conn, fid)
-            state["functions"][fid] = _make_composed_fn(state, composition, _exec)
+            constants = db.get_constants(conn, fid)
+            const_mode = db.get_const_mode(conn, fid)
+            state["functions"][fid] = _make_composed_fn(state, composition, _exec,
+                                                        constants, const_mode)
+            state["metadata"][fid]["constants"] = constants
+            state["metadata"][fid]["const_mode"] = const_mode
 
         state["next_id"] = max(state["next_id"], fid + 1)
 
@@ -204,7 +213,9 @@ def load_registry(conn: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------------------
 
 def register_learned(conn: sqlite3.Connection, state: dict, name: str,
-                     arity: int, composition: list[tuple[int, list[int]]]) -> int:
+                     arity: int, composition: list[tuple[int, list[int]]],
+                     constants: list[float] | None = None,
+                     const_mode: str = "multiplicative") -> int:
     """Register a new composed function. Returns the new function id."""
     # Check for duplicate name
     for fid, meta in state["metadata"].items():
@@ -215,10 +226,13 @@ def register_learned(conn: sqlite3.Connection, state: dict, name: str,
         return execute(state, fid, inp)
 
     fid = state["next_id"]
-    layer = db.add_learned(conn, fid, name, arity, composition)
+    layer = db.add_learned(conn, fid, name, arity, composition, constants,
+                           const_mode)
 
-    state["functions"][fid] = _make_composed_fn(state, composition, _exec)
-    state["metadata"][fid] = {"name": name, "arity": arity, "layer": layer}
+    state["functions"][fid] = _make_composed_fn(state, composition, _exec,
+                                                constants, const_mode)
+    state["metadata"][fid] = {"name": name, "arity": arity, "layer": layer,
+                              "constants": constants, "const_mode": const_mode}
     state["next_id"] = fid + 1
 
     return fid
@@ -228,12 +242,20 @@ def register_learned(conn: sqlite3.Connection, state: dict, name: str,
 # Composition execution
 # ---------------------------------------------------------------------------
 
-def _make_composed_fn(state: dict, composition: list[tuple[int, list[int]]], execute_fn):
+def _make_composed_fn(state: dict, composition: list[tuple[int, list[int]]],
+                      execute_fn, constants: list[float] | None = None,
+                      const_mode: str = "multiplicative"):
     """Build a callable that runs a composition step-by-step.
 
     Composition is a list of (child_func_id, arg_indices).
     arg_indices index into an `available_values` list that starts with the
     original inputs and grows as each step appends its result.
+
+    Special arg index -1 means literal 0 (used by LOOP for MUL).
+
+    If constants is provided, a final scaling/offset is applied:
+      multiplicative: result *= constants[0]
+      additive:       result += constants[0]
     """
     loop_id = state["loop_id"]
 
@@ -242,8 +264,6 @@ def _make_composed_fn(state: dict, composition: list[tuple[int, list[int]]], exe
 
         for child_id, args in composition:
             if child_id == loop_id and len(args) in (3, 4):
-                # LOOP(body_fn_id, count_idx, init_idx, [step_arg_idx])
-                # init_idx of -1 means literal 0 (used by loop_binary for MUL)
                 body_fn_id = args[0]
                 count = available[args[1]]
                 init_val = 0 if args[2] == -1 else available[args[2]]
@@ -252,13 +272,20 @@ def _make_composed_fn(state: dict, composition: list[tuple[int, list[int]]], exe
                     loop_args.append(available[args[3]])
                 result = execute_fn(child_id, loop_args)
             else:
-                # Normal step: gather args from available_values
                 step_inputs = [available[i] for i in args]
                 result = execute_fn(child_id, step_inputs)
 
             available.append(result)
 
-        return available[-1]
+        result = available[-1]
+
+        if constants:
+            if const_mode == "additive":
+                result = result + constants[0]
+            else:
+                result = result * constants[0]
+
+        return result
 
     return composed
 

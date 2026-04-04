@@ -10,6 +10,7 @@ the core pipeline code. Provides endpoints for:
   - Testing:     evaluate models against example sets, compare models
 """
 
+import math
 import os
 import csv
 import io
@@ -44,16 +45,16 @@ from main import build_composition, CONFIG, learn, curriculum_tasks
 
 class ExecuteRequest(BaseModel):
     func_id: int
-    inputs: list[int]
+    inputs: list[float]
 
 class ExecuteBatchRequest(BaseModel):
     func_id: int
-    input_sets: list[list[int]]
+    input_sets: list[list[float]]
 
 class ExpressionRequest(BaseModel):
     """Calculator mode: evaluate a named function on inputs."""
     func_name: str
-    inputs: list[int]
+    inputs: list[float]
 
 class RegisterRequest(BaseModel):
     name: str
@@ -63,14 +64,14 @@ class RegisterRequest(BaseModel):
 class DatasetCreate(BaseModel):
     name: str
     description: str = ""
-    examples: list[tuple[list[int], int]]
+    examples: list[tuple[list[float], float]]
 
 class DatasetFromFunction(BaseModel):
     """Generate a dataset by running a registered function on input sets."""
     name: str
     description: str = ""
     func_id: int
-    input_sets: list[list[int]]
+    input_sets: list[list[float]]
 
 class TrainRequest(BaseModel):
     model_name: str = "default"
@@ -419,7 +420,7 @@ def train_single(req: TrainRequest):
     examples = _datasets[req.dataset_name]["examples"]
 
     t0 = time.time()
-    ok, env["optimizer"] = learn(
+    ok, env["optimizer"], r2 = learn(
         env["conn"], env["state"], env["model"], env["optimizer"],
         req.target_name, examples,
         max_search_steps=req.max_search_steps,
@@ -436,6 +437,7 @@ def train_single(req: TrainRequest):
         "target": req.target_name,
         "dataset": req.dataset_name,
         "success": ok,
+        "r2_score": round(r2, 6),
         "elapsed_s": round(elapsed, 2),
         "vocab_size": reg.vocab_size(env["state"]),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -475,7 +477,7 @@ def run_experiment(req: ExperimentRequest):
 
         examples = _datasets[item.dataset_name]["examples"]
         t0 = time.time()
-        ok, env["optimizer"] = learn(
+        ok, env["optimizer"], r2 = learn(
             env["conn"], env["state"], env["model"], env["optimizer"],
             item.target_name, examples,
             max_depth=item.max_depth,
@@ -488,6 +490,7 @@ def run_experiment(req: ExperimentRequest):
             "target": item.target_name,
             "dataset": item.dataset_name,
             "success": ok,
+            "r2_score": round(r2, 6),
             "elapsed_s": round(elapsed, 2),
         }
         results.append(record)
@@ -533,6 +536,9 @@ def get_model_info(model_name: str):
                 {"func_id": cid, "func_name": reg.get_name(state, cid), "args": args}
                 for cid, args in comp
             ]
+            if m.get("constants"):
+                entry["constants"] = m["constants"]
+                entry["const_mode"] = m.get("const_mode", "multiplicative")
         functions.append(entry)
 
     return {
@@ -573,7 +579,10 @@ def delete_model(model_name: str):
 @app.post("/test/eval")
 def test_eval(req: EvalRequest):
     """Evaluate: for each example in a dataset, run the search/learned function
-    and check if the model's registry produces correct outputs."""
+    and check if the model's registry produces correct outputs.
+
+    Returns per-function R² scores and per-example details.
+    """
     if req.dataset_name not in _datasets:
         raise HTTPException(404, f"Dataset '{req.dataset_name}' not found")
 
@@ -581,22 +590,21 @@ def test_eval(req: EvalRequest):
     examples = _datasets[req.dataset_name]["examples"]
     state = env["state"]
 
+    # Per-example detail
     results = []
     correct = 0
     for inputs, expected in examples:
-        # Try every learned function to see which ones match
         matches = []
         for fid, meta in state["metadata"].items():
             if meta["arity"] != len(inputs):
                 continue
             try:
                 got = reg.execute(state, fid, inputs)
-                if got == expected:
+                if math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
                     matches.append({"id": fid, "name": meta["name"], "result": got})
             except Exception:
                 pass
 
-        # Also check if any function gives the right answer
         is_correct = len(matches) > 0
         if is_correct:
             correct += 1
@@ -608,12 +616,29 @@ def test_eval(req: EvalRequest):
             "matching_functions": matches,
         })
 
+    # Per-function R² scores (for all functions with matching arity)
+    input_arity = len(examples[0][0]) if examples else 0
+    r2_scores = {}
+    for fid, meta in state["metadata"].items():
+        if meta["arity"] != input_arity:
+            continue
+        r2 = exe.r_squared(state, fid, examples)
+        if r2 > -1e10:  # skip functions that error on all examples
+            r2_scores[meta["name"]] = round(r2, 6)
+
+    # Best R²
+    best_r2 = max(r2_scores.values()) if r2_scores else 0.0
+    best_fn = max(r2_scores, key=r2_scores.get) if r2_scores else None
+
     return {
         "model_name": req.model_name,
         "dataset": req.dataset_name,
         "total": len(examples),
         "correct": correct,
         "accuracy": round(correct / len(examples), 4) if examples else 0,
+        "r2_scores": r2_scores,
+        "best_r2": round(best_r2, 6),
+        "best_function": best_fn,
         "details": results,
     }
 
@@ -637,16 +662,31 @@ def test_compare(req: CompareRequest):
                 if meta["arity"] != len(inputs):
                     continue
                 try:
-                    if reg.execute(state, fid, inputs) == expected:
+                    got = reg.execute(state, fid, inputs)
+                    if math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
                         correct += 1
                         break
                 except Exception:
                     pass
 
+        # Best R² across all functions with matching arity
+        input_arity = len(examples[0][0]) if examples else 0
+        best_r2 = -float("inf")
+        best_fn = None
+        for fid, meta in state["metadata"].items():
+            if meta["arity"] != input_arity:
+                continue
+            r2 = exe.r_squared(state, fid, examples)
+            if r2 > best_r2:
+                best_r2 = r2
+                best_fn = meta["name"]
+
         comparison[model_name] = {
             "correct": correct,
             "total": len(examples),
             "accuracy": round(correct / len(examples), 4) if examples else 0,
+            "best_r2": round(best_r2, 6) if best_r2 > -1e10 else None,
+            "best_function": best_fn,
             "vocab_size": reg.vocab_size(state),
             "learned_functions": [
                 m["name"] for m in state["metadata"].values() if m["layer"] > 0
@@ -657,7 +697,7 @@ def test_compare(req: CompareRequest):
 
 
 @app.post("/test/predict")
-def test_predict(model_name: str, inputs: list[int]):
+def test_predict(model_name: str, inputs: list[float]):
     """Use the TRM model to predict which composition to use for given inputs.
 
     This shows what the neural network *thinks* the answer is, before

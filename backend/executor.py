@@ -13,6 +13,7 @@ A candidate is:
     }
 """
 
+import math
 from typing import Any
 
 import registry as reg
@@ -24,6 +25,21 @@ import registry as reg
 
 def run(state: dict, candidate: dict, inputs: list[int]) -> Any:
     """Execute a candidate program on the given inputs."""
+    result = _run_base(state, candidate, inputs)
+
+    # Apply fitted constants if present
+    constants = candidate.get("constants")
+    if constants:
+        if candidate.get("const_mode") == "additive":
+            result = result + constants[0]
+        else:
+            result = result * constants[0]
+
+    return result
+
+
+def _run_base(state: dict, candidate: dict, inputs: list) -> Any:
+    """Execute the base composition without constant adjustment."""
     comp = candidate["comp_type"]
     pid = candidate["primary_id"]
 
@@ -69,12 +85,42 @@ def run(state: dict, candidate: dict, inputs: list[int]) -> Any:
 # ---------------------------------------------------------------------------
 
 def validate(state: dict, candidate: dict,
-             examples: list[tuple[list[int], Any]]) -> bool:
-    """Check if a candidate produces the correct output for every example."""
+             examples: list[tuple[list, Any]]) -> bool:
+    """Check if a candidate produces the correct output for every example.
+
+    Uses math.isclose for float comparison (rel_tol=1e-6, abs_tol=1e-9).
+    """
     for inputs, expected in examples:
         try:
-            if run(state, candidate, inputs) != expected:
+            got = run(state, candidate, inputs)
+            if not math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
                 return False
         except Exception:
             return False
     return True
+
+
+def r_squared(state: dict, func_id: int,
+              examples: list[tuple[list, Any]]) -> float:
+    """Compute R² score for a registered function against examples."""
+    actuals = []
+    predictions = []
+    for inputs, expected in examples:
+        try:
+            got = reg.execute(state, func_id, inputs)
+            actuals.append(float(expected))
+            predictions.append(float(got))
+        except Exception:
+            return -float("inf")
+
+    if not actuals:
+        return -float("inf")
+
+    mean_actual = sum(actuals) / len(actuals)
+    ss_res = sum((a - p) ** 2 for a, p in zip(actuals, predictions))
+    ss_tot = sum((a - mean_actual) ** 2 for a in actuals)
+
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else -float("inf")
+
+    return 1.0 - ss_res / ss_tot

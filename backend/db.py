@@ -44,10 +44,14 @@ def add_primitive(conn: sqlite3.Connection, func_id: int, name: str, arity: int)
 
 
 def add_learned(conn: sqlite3.Connection, func_id: int, name: str, arity: int,
-                composition: list[tuple[int, list[int]]]) -> int:
+                composition: list[tuple[int, list[int]]],
+                constants: list[float] | None = None,
+                const_mode: str = "multiplicative") -> int:
     """Insert a learned function. Layer is auto-calculated from children.
 
     composition: list of (child_id, arg_indices) pairs.
+    constants: optional list of float constants (e.g. [0.5] for KE = 0.5*m*v²).
+    const_mode: "multiplicative" or "additive".
     Returns the computed layer.
     """
     if not composition:
@@ -64,11 +68,12 @@ def add_learned(conn: sqlite3.Connection, func_id: int, name: str, arity: int,
     layer = max_child_layer + 1
 
     comp_json = json.dumps([[cid, args] for cid, args in composition])
+    const_json = json.dumps(constants) if constants else None
 
     conn.execute(
-        "INSERT OR REPLACE INTO functions (id, name, arity, layer, composition) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (func_id, name, arity, layer, comp_json),
+        "INSERT OR REPLACE INTO functions (id, name, arity, layer, composition, constants, const_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (func_id, name, arity, layer, comp_json, const_json, const_mode),
     )
     conn.commit()
     return layer
@@ -92,6 +97,22 @@ def get_composition(conn: sqlite3.Connection, func_id: int) -> list[tuple[int, l
     if func is None or func["composition"] is None:
         return []
     return [(cid, args) for cid, args in func["composition"]]
+
+
+def get_constants(conn: sqlite3.Connection, func_id: int) -> list[float] | None:
+    """Return the constants list for a function, or None if no constants."""
+    func = get_function(conn, func_id)
+    if func is None or func.get("constants") is None:
+        return None
+    return func["constants"]
+
+
+def get_const_mode(conn: sqlite3.Connection, func_id: int) -> str:
+    """Return the const_mode for a function, default 'multiplicative'."""
+    func = get_function(conn, func_id)
+    if func is None:
+        return "multiplicative"
+    return func.get("const_mode") or "multiplicative"
 
 
 def get_all_functions(conn: sqlite3.Connection) -> list[dict]:
@@ -160,8 +181,10 @@ def print_summary(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
-    """Convert a Row to a plain dict, parsing composition JSON if present."""
+    """Convert a Row to a plain dict, parsing composition and constants JSON."""
     d = dict(row)
     if d["composition"] is not None:
         d["composition"] = json.loads(d["composition"])
+    if d.get("constants") is not None:
+        d["constants"] = json.loads(d["constants"])
     return d

@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS functions (
     arity       INTEGER NOT NULL,
     layer       INTEGER NOT NULL,
     composition TEXT,
+    constants   TEXT,
+    const_mode  TEXT DEFAULT 'multiplicative',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """
