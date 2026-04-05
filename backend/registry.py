@@ -44,6 +44,9 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         "NOT":   (1, _factory(lambda inp: ~inp[0])),
 
         # -- Arithmetic --
+        "ADD":   (2, _factory(lambda inp: inp[0] + inp[1])),
+        "SUB":   (2, _factory(lambda inp: inp[0] - inp[1])),
+        "MUL":   (2, _factory(lambda inp: inp[0] * inp[1])),
         "INC":   (1, _factory(lambda inp: inp[0] + 1)),
         "DEC":   (1, _factory(lambda inp: inp[0] - 1)),
 
@@ -79,13 +82,18 @@ def _loop_factory(execute_fn):
       ADD(a,b) = LOOP(INC, b, a)        — 3 args, unary
       MUL(a,b) = LOOP(ADD, b, 0, a)     — 4 args, binary: ADD(accum, a) repeated b times
     """
+    MAX_LOOP_ITERS = 1000
+
     def loop_impl(inputs):
         if len(inputs) < 3:
             raise ValueError(f"LOOP expects 3-4 args [body_fn_id, count, init, (step_arg)], got {len(inputs)}")
         body_fn_id, count, init_value = int(inputs[0]), inputs[1], inputs[2]
         step_arg = inputs[3] if len(inputs) >= 4 else None
+        n = int(count)
+        if n < 0 or n > MAX_LOOP_ITERS:
+            raise ValueError(f"LOOP count {n} out of range [0, {MAX_LOOP_ITERS}]")
         result = init_value
-        for _ in range(int(count)):
+        for _ in range(n):
             if step_arg is not None:
                 result = execute_fn(body_fn_id, [result, step_arg])
             else:
@@ -100,7 +108,10 @@ def _while_factory(execute_fn):
         if len(inputs) != 4:
             raise ValueError(f"WHILE expects 4 args [cond_fn, body_fn, state, limit], got {len(inputs)}")
         cond_fn_id, body_fn_id, state, limit = int(inputs[0]), int(inputs[1]), inputs[2], inputs[3]
-        for _ in range(int(limit)):
+        n = min(int(limit), 1000)
+        if n < 0:
+            raise ValueError(f"WHILE limit {n} < 0")
+        for _ in range(n):
             if execute_fn(cond_fn_id, [state]) == 0:
                 break
             state = execute_fn(body_fn_id, [state])
@@ -115,7 +126,10 @@ def _accum_factory(execute_fn):
             raise ValueError(f"ACCUM expects 5 args [cond_fn, body_fn, state, counter, limit], got {len(inputs)}")
         cond_fn_id, body_fn_id = int(inputs[0]), int(inputs[1])
         state, counter, limit = inputs[2], inputs[3], inputs[4]
-        for _ in range(int(limit)):
+        n = min(int(limit), 1000)
+        if n < 0:
+            raise ValueError(f"ACCUM limit {n} < 0")
+        for _ in range(n):
             if execute_fn(cond_fn_id, [state]) == 0:
                 break
             state = execute_fn(body_fn_id, [state])

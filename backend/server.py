@@ -141,25 +141,33 @@ def _get_or_create_env(model_name: str) -> dict:
     # Try loading existing checkpoint
     ckpt_path = os.path.join(ckpt_dir, "model.pt")
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, weights_only=False)
-        old_n = ckpt["n_functions"]
-        new_n = n_funcs
-        if old_n != new_n:
-            tmp = create_model(
-                input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
-                d_model=CONFIG["d_model"], n_functions=old_n,
-                n_layers=CONFIG["n_layers"],
-                n_recursions=CONFIG["n_recursions"], T=CONFIG["T"],
-            )
-            tmp.load_state_dict(ckpt["model_state"], strict=False)
-            model.load_state_dict(tmp.state_dict(), strict=False)
-            resize_heads(model, old_n, new_n)
-        else:
-            model.load_state_dict(ckpt["model_state"], strict=False)
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state"])
-            except Exception:
-                pass
+        try:
+            ckpt = torch.load(ckpt_path, weights_only=False)
+            old_n = ckpt["n_functions"]
+            new_n = n_funcs
+            if old_n == new_n:
+                model.load_state_dict(ckpt["model_state"], strict=False)
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state"])
+                except Exception:
+                    pass
+            elif old_n < new_n:
+                # DB has more functions than checkpoint (new primitives added)
+                tmp = create_model(
+                    input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
+                    d_model=CONFIG["d_model"], n_functions=old_n,
+                    n_layers=CONFIG["n_layers"],
+                    n_recursions=CONFIG["n_recursions"], T=CONFIG["T"],
+                )
+                tmp.load_state_dict(ckpt["model_state"], strict=False)
+                resize_heads(tmp, old_n, new_n)
+                model.load_state_dict(tmp.state_dict(), strict=False)
+            else:
+                # Checkpoint has more functions than DB — stale, skip it
+                print(f"  Stale checkpoint for '{model_name}' ({old_n} > {new_n} funcs), starting fresh.")
+        except Exception as e:
+            print(f"  Warning: could not load checkpoint for '{model_name}': {e}")
+            print(f"  Starting with fresh model.")
 
     env = {
         "conn": conn,
@@ -593,15 +601,38 @@ def test_eval(req: EvalRequest):
     # Per-example detail
     results = []
     correct = 0
+    input_len = len(examples[0][0]) if examples else 0
+
+    # Pre-compute routing permutations for functions with arity < input_len
+    from itertools import permutations as _perms
+    input_len = len(examples[0][0]) if examples else 0
+
     for inputs, expected in examples:
         matches = []
         for fid, meta in state["metadata"].items():
-            if meta["arity"] != len(inputs):
+            arity = meta["arity"]
+            if arity < 0 or arity > input_len:
                 continue
             try:
-                got = reg.execute(state, fid, inputs)
-                if math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
-                    matches.append({"id": fid, "name": meta["name"], "result": got})
+                if arity == input_len:
+                    got = reg.execute(state, fid, inputs)
+                    if math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
+                        matches.append({"id": fid, "name": meta["name"], "result": got})
+                elif arity > 0:
+                    # Try routing subsets — the function's composition uses
+                    # positions 0..arity-1, so we need to find which columns
+                    # from the input to place in those positions.
+                    found = False
+                    for perm in _perms(range(input_len), arity):
+                        routed = [inputs[i] for i in perm]
+                        try:
+                            got = reg.execute(state, fid, routed)
+                            if math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-9):
+                                matches.append({"id": fid, "name": meta["name"], "result": got})
+                                found = True
+                                break
+                        except Exception:
+                            continue
             except Exception:
                 pass
 
@@ -616,14 +647,26 @@ def test_eval(req: EvalRequest):
             "matching_functions": matches,
         })
 
-    # Per-function R² scores (for all functions with matching arity)
-    input_arity = len(examples[0][0]) if examples else 0
+    # Per-function R² scores (for all functions with arity <= input width)
     r2_scores = {}
     for fid, meta in state["metadata"].items():
-        if meta["arity"] != input_arity:
+        arity = meta["arity"]
+        if arity < 0 or arity > input_len:
             continue
-        r2 = exe.r_squared(state, fid, examples)
-        if r2 > -1e10:  # skip functions that error on all examples
+        if arity == input_len:
+            r2 = exe.r_squared(state, fid, examples)
+        else:
+            # Try all routing permutations, pick best R²
+            r2 = -float("inf")
+            for perm in _perms(range(input_len), arity):
+                routed_examples = [
+                    ([inp[i] for i in perm], exp)
+                    for inp, exp in examples
+                ]
+                candidate_r2 = exe.r_squared(state, fid, routed_examples)
+                if candidate_r2 > r2:
+                    r2 = candidate_r2
+        if r2 > -1e10:
             r2_scores[meta["name"]] = round(r2, 6)
 
     # Best R²
@@ -659,7 +702,7 @@ def test_compare(req: CompareRequest):
         correct = 0
         for inputs, expected in examples:
             for fid, meta in state["metadata"].items():
-                if meta["arity"] != len(inputs):
+                if meta["arity"] > len(inputs):
                     continue
                 try:
                     got = reg.execute(state, fid, inputs)
@@ -669,12 +712,12 @@ def test_compare(req: CompareRequest):
                 except Exception:
                     pass
 
-        # Best R² across all functions with matching arity
+        # Best R² across all functions with arity <= input width
         input_arity = len(examples[0][0]) if examples else 0
         best_r2 = -float("inf")
         best_fn = None
         for fid, meta in state["metadata"].items():
-            if meta["arity"] != input_arity:
+            if meta["arity"] > input_arity:
                 continue
             r2 = exe.r_squared(state, fid, examples)
             if r2 > best_r2:

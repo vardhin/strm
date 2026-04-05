@@ -28,7 +28,7 @@ from model import TRM, create_model, fresh_carry, resize_heads
 
 CONFIG = {
     "input_dim": 32,
-    "seq_len": 4,
+    "seq_len": 8,
     "d_model": 128,
     "n_heads": 8,
     "n_layers": 2,          # tiny network — "less is more"
@@ -51,14 +51,20 @@ def build_composition(candidate: dict, input_arity: int,
 
     A composition is [(func_id, [arg_indices]), ...] where arg_indices
     reference positions in an `available_values` list (inputs ++ prior results).
+
+    Routing: candidate["routing"] is a list of column-index lists.
+    For non-parallel types, routing[0] selects which input columns to use.
+    For parallel, routing[0] and routing[1] select columns for each branch.
     """
     comp_type = candidate["comp_type"]
     pid = candidate["primary_id"]
     sid = candidate.get("secondary_id")
     tid = candidate.get("tertiary_id")
+    routing = candidate.get("routing")
 
     if comp_type == "none":
-        return [(pid, list(range(input_arity)))]
+        cols = routing[0] if routing else list(range(input_arity))
+        return [(pid, cols)]
 
     if comp_type == "loop_direct":
         # LOOP(body_fn=sid, count=input[1], init=input[0])
@@ -66,28 +72,26 @@ def build_composition(candidate: dict, input_arity: int,
 
     if comp_type == "loop_binary":
         # MUL(a,b) = LOOP(ADD, count=b, init=0, step_arg=a)
-        # 4-arg LOOP in composition: [body_fn_id, count_idx, init_idx, step_arg_idx]
-        # init_idx uses a special marker -1 meaning "literal 0"
         return [(pid, [sid, 1, -1, 0])]
 
     if comp_type == "sequential":
-        # secondary(inputs) -> primary(result)
+        # secondary(routed_inputs) -> primary(result)
+        cols = routing[0] if routing else list(range(input_arity))
         return [
-            (sid, list(range(input_arity))),
+            (sid, cols),
             (pid, [input_arity]),
         ]
 
     if comp_type == "nested":
-        # primary(secondary(x0), secondary(x1))
-        return [
-            (sid, [0]),
-            (sid, [1]),
-            (pid, [input_arity, input_arity + 1]),
-        ]
+        # primary(secondary(x_i), secondary(x_j), ...)
+        cols = routing[0] if routing else list(range(input_arity))
+        steps = [(sid, [c]) for c in cols]
+        combiner_args = [input_arity + i for i in range(len(cols))]
+        steps.append((pid, combiner_args))
+        return steps
 
     if comp_type == "parallel":
         # tertiary(primary(routed_inputs), secondary(routed_inputs))
-        routing = candidate.get("routing")
         if routing:
             comp = [
                 (pid, routing[0]),
@@ -125,12 +129,10 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
     print(f"Learning: {name}")
     print(f"{'=' * 50}")
 
-    # Phase 1: search
+    # Phase 1: search (guided only — no exhaustive fallback)
     x_input = search.format_examples(examples, input_dim=input_dim, seq_len=seq_len)
     candidate = search.guided(state, model, examples, x_input,
                               max_steps=max_search_steps, max_depth=max_depth)
-    if candidate is None:
-        candidate = search.exhaustive(state, examples, max_depth=max_depth)
 
     if candidate is None:
         print(f"  could not find composition for {name}")
@@ -143,15 +145,19 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
     else:
         print(f"  found: {_fmt_candidate(state, candidate)}")
 
-    # Phase 2: simplify
+    # Phase 2: simplify (strips unused input columns)
     input_arity = len(examples[0][0])
     composition = build_composition(candidate, input_arity, state["loop_id"])
-    composition = simplify.simplify(state, composition, examples, constants, const_mode)
+    composition, effective_arity, used_cols = simplify.simplify(
+        state, composition, examples, constants, const_mode)
 
     # Phase 3: register
     old_vocab = reg.vocab_size(state)
-    fid = reg.register_learned(conn, state, name, input_arity, composition,
+    fid = reg.register_learned(conn, state, name, effective_arity, composition,
                                constants, const_mode)
+    # Store which original columns this function uses (for routing in compositions)
+    if used_cols is not None:
+        state["metadata"][fid]["used_cols"] = used_cols
     new_vocab = reg.vocab_size(state)
     print(f"  registered {name} as id={fid}")
 
@@ -166,8 +172,12 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
                             input_dim=input_dim, seq_len=seq_len,
                             num_epochs=num_epochs, n_sup=CONFIG["n_sup"])
 
-    # Verify (R² score)
-    r2 = exe.r_squared(state, fid, examples)
+    # Verify (R² score) — use stripped examples if columns were removed
+    if used_cols is not None:
+        verify_examples = [([inp[c] for c in used_cols], exp) for inp, exp in examples]
+    else:
+        verify_examples = examples
+    r2 = exe.r_squared(state, fid, verify_examples)
     ok = r2 > 0.999
     print(f"  verification: R²={r2:.6f} ({'passed' if ok else 'FAILED'})")
     return ok, optimizer, r2
@@ -190,6 +200,9 @@ def curriculum_tasks(state: dict) -> list[dict]:
     or_id = _find("OR")
     and_id = _find("AND")
     not_id = _find("NOT")
+    add_id = _find("ADD")
+    sub_id = _find("SUB")
+    mul_id = _find("MUL")
     inc_id = _find("INC")
     dec_id = _find("DEC")
 
@@ -202,6 +215,15 @@ def curriculum_tasks(state: dict) -> list[dict]:
     if not_id is not None:
         tasks.append({"target": {"primary_id": not_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
                        "examples": [([0], ~0), ([1], ~1), ([5], ~5), ([7], ~7)]})
+    if add_id is not None:
+        tasks.append({"target": {"primary_id": add_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
+                       "examples": [([0, 0], 0), ([1, 2], 3), ([5, 3], 8), ([7, 10], 17)]})
+    if sub_id is not None:
+        tasks.append({"target": {"primary_id": sub_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
+                       "examples": [([5, 2], 3), ([10, 3], 7), ([7, 7], 0), ([8, 4], 4)]})
+    if mul_id is not None:
+        tasks.append({"target": {"primary_id": mul_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
+                       "examples": [([0, 5], 0), ([1, 5], 5), ([2, 3], 6), ([4, 5], 20)]})
     if inc_id is not None:
         tasks.append({"target": {"primary_id": inc_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
                        "examples": [([0], 1), ([1], 2), ([5], 6), ([10], 11)]})
@@ -222,15 +244,6 @@ TARGETS = [
 
     ("XOR",  [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 0),
               ([5, 3], 5^3), ([7, 2], 7^2), ([15, 10], 15^10)]),
-
-    ("ADD",  [([0, 0], 0), ([0, 1], 1), ([1, 0], 1), ([1, 1], 2),
-              ([2, 3], 5), ([4, 2], 6), ([5, 5], 10), ([7, 3], 10)]),
-
-    ("SUB",  [([5, 2], 3), ([10, 3], 7), ([7, 7], 0), ([8, 4], 4),
-              ([15, 5], 10), ([20, 8], 12)]),
-
-    ("MUL",  [([0, 0], 0), ([0, 5], 0), ([1, 5], 5), ([2, 3], 6),
-              ([3, 4], 12), ([4, 5], 20), ([5, 5], 25)]),
 ]
 
 
@@ -253,27 +266,32 @@ def load_checkpoint(model: TRM, optimizer: torch.optim.Optimizer, state: dict):
     path = os.path.join(CONFIG["checkpoint_dir"], "model.pt")
     if not os.path.exists(path):
         return False
-    ckpt = torch.load(path, weights_only=False)
-    old_n = ckpt["n_functions"]
-    new_n = reg.vocab_size(state)
-    if old_n != new_n:
-        # Load into a temp model with old vocab, then resize
-        tmp = create_model(input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
-                           d_model=CONFIG["d_model"], n_functions=old_n,
-                           n_layers=CONFIG["n_layers"],
-                           n_recursions=CONFIG["n_recursions"], T=CONFIG["T"])
-        tmp.load_state_dict(ckpt["model_state"], strict=False)
-        # Copy weights into current model
-        model.load_state_dict(tmp.state_dict(), strict=False)
-        resize_heads(model, old_n, new_n)
-    else:
-        model.load_state_dict(ckpt["model_state"], strict=False)
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-        except Exception:
-            pass
-    print(f"  checkpoint loaded ({old_n} -> {new_n} functions)")
-    return True
+    try:
+        ckpt = torch.load(path, weights_only=False)
+        old_n = ckpt["n_functions"]
+        new_n = reg.vocab_size(state)
+        if old_n == new_n:
+            model.load_state_dict(ckpt["model_state"], strict=False)
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            except Exception:
+                pass
+        elif old_n < new_n:
+            tmp = create_model(input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
+                               d_model=CONFIG["d_model"], n_functions=old_n,
+                               n_layers=CONFIG["n_layers"],
+                               n_recursions=CONFIG["n_recursions"], T=CONFIG["T"])
+            tmp.load_state_dict(ckpt["model_state"], strict=False)
+            resize_heads(tmp, old_n, new_n)
+            model.load_state_dict(tmp.state_dict(), strict=False)
+        else:
+            print(f"  Stale checkpoint ({old_n} > {new_n} funcs), starting fresh.")
+            return False
+        print(f"  checkpoint loaded ({old_n} -> {new_n} functions)")
+        return True
+    except Exception as e:
+        print(f"  Warning: could not load checkpoint: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
