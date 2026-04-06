@@ -550,7 +550,8 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
         comp_logits = outputs["composition_logits"].detach().mean(dim=0) / temperature
 
         # Top-k predictions (grows with step for diversity, wider on retries)
-        top_k = min(3 + step + int(temperature_boost * 2), n_functions)
+        # Starts at 3, grows every 4 steps, but NEVER exceeds 8
+        top_k = min(3 + (step // 4) + int(temperature_boost * 2), 8)
         tops = {k: torch.topk(v, min(top_k, len(v))).indices for k, v in logits.items()}
         comp_top = torch.topk(comp_logits, min(len(COMP_TYPES), len(comp_logits))).indices
 
@@ -936,7 +937,7 @@ def _add_parallel_candidates(candidates: list, state: dict,
                              pid: int, sid: int, tid: int,
                              input_arity: int, comp: str,
                              null_subsets: list[list[int]],
-                             max_routings: int = 30):
+                             max_routings: int = 300):
     """Add parallel candidates with NULL column variants."""
     meta_p = state["metadata"].get(pid)
     meta_s = state["metadata"].get(sid)
@@ -1098,17 +1099,49 @@ def _cand_key(c: dict) -> tuple:
 
 def format_examples(examples: list[tuple[list, Any]], *,
                     input_dim: int, seq_len: int) -> torch.Tensor:
-    """Encode examples as float vectors for the TRM."""
+    """Encode examples for the TRM with batch-wise Z-score normalization.
+
+    Input columns are normalized independently across the batch, and the
+    normalized target is written as an extra sequence token so the model can
+    condition on the desired output pattern.
+    """
     batch_size = len(examples)
     data = torch.zeros(batch_size, seq_len, input_dim, dtype=torch.float32)
 
-    for b, (inputs, _) in enumerate(examples):
-        for pos in range(min(len(inputs), seq_len)):
-            val = float(inputs[pos])
-            data[b, pos, 0] = val / 100.0
+    if batch_size == 0 or seq_len == 0:
+        return data
+
+    input_arity = len(examples[0][0])
+
+    # Collect per-column values plus targets for normalization across batch.
+    cols = [[float(ex[0][i]) for ex in examples] for i in range(input_arity)]
+    targets = [float(ex[1]) for ex in examples]
+
+    def z_score(vals: list[float]) -> list[float]:
+        mean_v = sum(vals) / len(vals)
+        var_v = sum((v - mean_v) ** 2 for v in vals) / len(vals)
+        std_v = math.sqrt(var_v) + 1e-8
+        return [(v - mean_v) / std_v for v in vals]
+
+    norm_cols = [z_score(c) for c in cols]
+    norm_targets = z_score(targets)
+
+    for b in range(batch_size):
+        # Write normalized inputs.
+        for pos in range(min(input_arity, seq_len - 1)):
+            val = norm_cols[pos][b]
+            data[b, pos, 0] = val
             data[b, pos, 1] = 1.0 if val >= 0 else -1.0
-            data[b, pos, 2] = torch.log1p(torch.tensor(abs(val))).item()
+            data[b, pos, 2] = math.log1p(abs(val))
             data[b, pos, 3] = val - int(val) if val >= 0 else -(abs(val) - int(abs(val)))
+
+        # Write normalized target as the next token.
+        target_pos = min(input_arity, seq_len - 1)
+        t_val = norm_targets[b]
+        data[b, target_pos, 0] = t_val
+        data[b, target_pos, 1] = 1.0 if t_val >= 0 else -1.0
+        data[b, target_pos, 2] = math.log1p(abs(t_val))
+        data[b, target_pos, 3] = t_val - int(t_val) if t_val >= 0 else -(abs(t_val) - int(abs(t_val)))
 
     return data
 
@@ -1427,7 +1460,7 @@ def learn(conn: sqlite3.Connection, state: dict, model,
           optimizer: torch.optim.Optimizer, name: str,
           examples: list[tuple[list, float | int]], *,
           max_search_steps: int = 10, max_depth: int = 3,
-          num_epochs: int = 30, max_retries: int = 2):
+          num_epochs: int = 30):
     
     input_dim = CONFIG["input_dim"]
     seq_len = CONFIG["seq_len"]
@@ -1445,15 +1478,8 @@ def learn(conn: sqlite3.Connection, state: dict, model,
     print(f"{'=' * 50}")
 
     x_input = format_examples(examples, input_dim=input_dim, seq_len=seq_len)
-    candidate = None
-    for attempt in range(1 + max_retries):
-        candidate = guided(state, model, examples, x_input,
-                           max_steps=max_search_steps, max_depth=max_depth,
-                           temperature_boost=attempt * 1.0)
-        if candidate is not None:
-            break
-        if attempt < max_retries:
-            print(f"  search failed (attempt {attempt + 1}), retrying with higher temperature...")
+    candidate = guided(state, model, examples, x_input,
+                       max_steps=max_search_steps, max_depth=max_depth)
 
     if candidate is None:
         print(f"  could not find composition for {name}")
@@ -1699,16 +1725,16 @@ def main():
     ke_train = [([float(m), noisy_correlated(m), float(v)], 0.5 * m * v * v) 
                 for m in [1, 2, 3, 4, 5] for v in [1, 2, 3, 4, 5]]
     _, optimizer, _ = learn(conn, state, model, optimizer, "KE_N", ke_train[:25], 
-                            max_depth=5, num_epochs=50, max_search_steps=100)
+                            max_depth=5, num_epochs=50, max_search_steps=60)
     
-    """
+    
     # Step 5: PE with junk columns on both sides
     print("\n[Step 5] PE(m,h) = m*9.81*h with junk on both sides [junk, m, junk, h]")
     g = 9.81
     pe_train = [([junk(), float(m), junk(), float(h)], m * g * h) 
                 for m in [1, 2, 3, 4, 5] for h in [1, 2, 3, 4, 5, 6]]
     _, optimizer, _ = learn(conn, state, model, optimizer, "PE_N", pe_train[:30], 
-                            max_depth=5, num_epochs=50, max_search_steps=100)
+                            max_depth=5, num_epochs=50, max_search_steps=60)
 
 
     print("\n--- PART 3: SYNTHESIS WITH NOISE ---")
@@ -1724,8 +1750,8 @@ def main():
                 energy_train.append(([float(m), junk(), float(v), junk(), float(h)], ke + pe))
                 
     _, optimizer, _ = learn(conn, state, model, optimizer, "TOTAL_E_N", energy_train[:48], 
-                            max_depth=5, num_epochs=60, max_search_steps=100)
-    """
+                            max_depth=5, num_epochs=60, max_search_steps=60)
+    
     print("\n--- Experiment Complete ---")
     save_checkpoint(model, optimizer, state)
     db.print_summary(conn)
