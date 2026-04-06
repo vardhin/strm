@@ -537,6 +537,7 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
 
     # Pre-compute NULL column subsets: all ways to drop 0..N-1 columns
     null_subsets = _null_column_subsets(input_arity)
+    valid_perfect_matches: list[dict] = []
 
     for step in range(max_steps):
         carry, outputs = model(carry, x_input)
@@ -575,16 +576,15 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
             else:
                 near_misses.append(cand)
 
-        # If we found valid candidates, return the simplest one
+        # Collect valid candidates and defer selection until search ends
         if valid_candidates:
-            best = min(valid_candidates, key=_complexity_score)
-            return best, 1.0
+            valid_perfect_matches.extend(valid_candidates)
 
         # Incremental constant fitting
         step_misses = near_misses[-new_count:] if new_count > 0 else []
-        fitted = _try_fit_any(state, step_misses, train_examples)
+        fitted = _try_fit_best(state, step_misses, train_examples)
         if fitted is not None and exe.validate(state, fitted, holdout_examples):
-            return fitted, 1.0
+            valid_perfect_matches.append(fitted)
 
         # Small noise on carry for exploration
         with torch.no_grad():
@@ -592,9 +592,13 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
             carry.z = carry.z + torch.randn_like(carry.z) * 0.01
 
     # Final pass: constant fitting on near misses
-    fitted = _try_fit_any(state, near_misses, train_examples)
-    if fitted is not None and exe.validate(state, fitted, holdout_examples):
-        return fitted, 1.0
+    final_fitted = _try_fit_best(state, near_misses, train_examples)
+    if final_fitted is not None and exe.validate(state, final_fitted, holdout_examples):
+        valid_perfect_matches.append(final_fitted)
+
+    if valid_perfect_matches:
+        best_overall = min(valid_perfect_matches, key=_complexity_score)
+        return best_overall, 1.0
 
     # Score best near miss
     best_r2 = -1.0
@@ -1008,6 +1012,22 @@ def _try_fit_any(state: dict, candidates: list[dict],
         if fitted is not None:
             return fitted
     return None
+
+
+def _try_fit_best(state: dict, candidates: list[dict],
+                  examples: list[tuple[list, Any]]) -> dict | None:
+    """Try constant-fitting and return the mathematically simplest match."""
+    valid_fits = []
+    for cand in candidates:
+        fitted = _try_fit_constants(state, cand, examples)
+        if fitted is not None:
+            valid_fits.append(fitted)
+
+    if not valid_fits:
+        return None
+
+    # Occam's Razor: sort by complexity score and return the simplest.
+    return min(valid_fits, key=_complexity_score)
 
 
 def _fit_scale(produced: list[float], expected: list[float]) -> float | None:
