@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import os
 import torch
 import sqlite3
+import random
 
 import executor as exe
 import registry as reg
@@ -1298,6 +1299,19 @@ def train_on_replay(model: TRM, optimizer: torch.optim.Optimizer,
     return losses
 
 # ==========================================
+# --- helpers ---
+# ==========================================
+
+def junk():
+    """Random junk value that has no relationship to the output."""
+    return round(random.uniform(-100, 100), 2)
+
+def noisy_correlated(val):
+    """A value loosely correlated with `val` — multicollinearity trap."""
+    return round(val + random.uniform(-3, 3), 2)
+
+
+# ==========================================
 # --- main.py (Orchestrator) ---
 # ==========================================
 
@@ -1627,7 +1641,7 @@ def main():
 
     conn = db.init_db(os.path.join(CONFIG["checkpoint_dir"], "symbolic.db"))
     state = reg.init_registry(conn)
-    print(f"primitives: {list(reg.get_names(state, list(state['metadata'].keys())))}")
+    print(f"primitives: {list(reg.get_names(state, list(state['metadata'].keys())))}\n")
 
     n_funcs = reg.vocab_size(state)
     model = create_model(input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
@@ -1643,16 +1657,60 @@ def main():
                           input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
                           num_epochs=20, n_sup=CONFIG["n_sup"])
 
-    print("\n--- Progressive learning ---")
-    for name, examples in TARGETS:
-        depth = 3 if name in ("XOR", "MUL") else 2
-        epochs = 50 if name in ("XOR", "MUL") else 30
-        _, optimizer, _ = learn(conn, state, model, optimizer, name, examples,
-                                max_depth=depth, num_epochs=epochs)
+    print("\n--- PART 1: DUMMY COLUMNS (zero signal) ---")
 
+    # Step 2: SQUARE with dummy columns
+    print("\n[Step 2] SQUARE(x) = x*x with 2 junk columns [x, junk1, junk2]")
+    sq_train = [([float(x), junk(), junk()], float(x * x)) for x in range(1, 13)]
+    _, optimizer, _ = learn(conn, state, model, optimizer, "SQUARE_N", sq_train, 
+                            max_depth=5, num_epochs=40, max_search_steps=15)
+
+    # Step 3: FORCE with dummy columns
+    print("\n[Step 3] FORCE(m,a) = m*a with junk columns interleaved [m, junk1, a, junk2]")
+    f_train = [([float(m), junk(), float(a), junk()], float(m * a)) 
+               for m in [1, 2, 3, 4, 5, 6] for a in [1, 2, 3, 4, 5]]
+    _, optimizer, _ = learn(conn, state, model, optimizer, "FORCE_N", f_train[:24], 
+                            max_depth=5, num_epochs=50, max_search_steps=20)
+
+
+    print("\n--- PART 2: NOISY / CORRELATED COLUMNS ---")
+    
+    # Step 4: KE with a correlated noise column
+    print("\n[Step 4] KE(m,v) = 0.5*m*v² with correlated noise column [m, noise_correlated, v]")
+    ke_train = [([float(m), noisy_correlated(m), float(v)], 0.5 * m * v * v) 
+                for m in [1, 2, 3, 4, 5] for v in [1, 2, 3, 4, 5]]
+    _, optimizer, _ = learn(conn, state, model, optimizer, "KE_N", ke_train[:25], 
+                            max_depth=5, num_epochs=50, max_search_steps=20)
+
+    # Step 5: PE with junk columns on both sides
+    print("\n[Step 5] PE(m,h) = m*9.81*h with junk on both sides [junk, m, junk, h]")
+    g = 9.81
+    pe_train = [([junk(), float(m), junk(), float(h)], m * g * h) 
+                for m in [1, 2, 3, 4, 5] for h in [1, 2, 3, 4, 5, 6]]
+    _, optimizer, _ = learn(conn, state, model, optimizer, "PE_N", pe_train[:30], 
+                            max_depth=5, num_epochs=50, max_search_steps=20)
+
+
+    print("\n--- PART 3: SYNTHESIS WITH NOISE ---")
+
+    # Step 6: TOTAL_E with noise
+    print("\n[Step 6] E(m,v,h) = KE + PE with junk columns [m, junk, v, junk, h]")
+    energy_train = []
+    for m in [1, 2, 3, 4]:
+        for v in [1, 2, 3, 4]:
+            for h in [1, 2, 3]:
+                ke = 0.5 * m * v * v
+                pe = m * g * h
+                energy_train.append(([float(m), junk(), float(v), junk(), float(h)], ke + pe))
+                
+    _, optimizer, _ = learn(conn, state, model, optimizer, "TOTAL_E_N", energy_train[:48], 
+                            max_depth=5, num_epochs=60, max_search_steps=25)
+                            
+    print("\n--- Experiment Complete ---")
     save_checkpoint(model, optimizer, state)
     db.print_summary(conn)
     conn.close()
 
 if __name__ == "__main__":
+    random.seed(42)
     main()
