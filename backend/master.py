@@ -501,6 +501,36 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
     return result
 
 
+def guided_with_score(state: dict, model, examples: list[tuple[list[int], Any]],
+                      x_input: torch.Tensor, *, max_steps: int = 10,
+                      max_depth: int = 3,
+                      temperature_boost: float = 0.0) -> tuple[dict | None, float]:
+    """Guided search that also returns confidence score.
+
+    Score is 1.0 for validated exact matches, otherwise best near-miss R^2.
+    """
+    return _guided_inner(state, model, examples, x_input,
+                         max_steps=max_steps, max_depth=max_depth,
+                         temperature_boost=temperature_boost)
+
+
+def _get_nucleus_pool(logits: torch.Tensor, p: float,
+                      min_k: int, max_k: int) -> list[int]:
+    """Expand the candidate pool until cumulative probability reaches p."""
+    probs = torch.softmax(logits, dim=-1).flatten()
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    exceeds = (cumulative_probs > p).nonzero(as_tuple=True)[0]
+    if len(exceeds) > 0:
+        k = exceeds[0].item() + 1
+    else:
+        k = len(probs)
+
+    k = max(min_k, min(k, max_k, len(probs)))
+    return sorted_indices[:k].tolist()
+
+
 def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
                   x_input: torch.Tensor, *, max_steps: int = 10,
                   max_depth: int = 3,
@@ -549,10 +579,15 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
         }
         comp_logits = outputs["composition_logits"].detach().mean(dim=0) / temperature
 
-        # Top-k predictions (grows with step for diversity, wider on retries)
-        # Starts at 3, grows every 4 steps, but NEVER exceeds 8
-        top_k = min(3 + (step // 4) + int(temperature_boost * 2), 8)
-        tops = {k: torch.topk(v, min(top_k, len(v))).indices for k, v in logits.items()}
+        # Dynamic Top-P (nucleus) predictions.
+        # Starts focused and expands as search progresses or retries increase.
+        dynamic_p = min(0.85 + (step * 0.005) + (temperature_boost * 0.05), 0.99)
+        min_k = min(max(1, 3 + (step // 4)), n_functions)
+        tops = {
+            k: torch.tensor(_get_nucleus_pool(v, dynamic_p, min_k, n_functions),
+                            dtype=torch.long)
+            for k, v in logits.items()
+        }
         comp_top = torch.topk(comp_logits, min(len(COMP_TYPES), len(comp_logits))).indices
 
         # Log TRM thought process
@@ -601,8 +636,9 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
         best_overall = min(valid_perfect_matches, key=_complexity_score)
         return best_overall, 1.0
 
-    # Score best near miss
+    # Score best near miss and pass it up for hindsight replay.
     best_r2 = -1.0
+    best_miss = None
     if near_misses:
         _log_near_misses(state, near_misses, examples)
         for cand in near_misses:
@@ -615,9 +651,17 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
                 except Exception:
                     break
             if len(produced) == len(examples):
-                best_r2 = max(best_r2, _r2(expected, produced))
+                r2 = _r2(expected, produced)
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_miss = cand
 
-    return None, best_r2
+    if best_miss is not None:
+        scored_miss = dict(best_miss)
+        scored_miss["_score"] = best_r2
+        return scored_miss, best_r2
+
+    return None, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1478,11 +1522,39 @@ def learn(conn: sqlite3.Connection, state: dict, model,
     print(f"{'=' * 50}")
 
     x_input = format_examples(examples, input_dim=input_dim, seq_len=seq_len)
-    candidate = guided(state, model, examples, x_input,
-                       max_steps=max_search_steps, max_depth=max_depth)
+    candidate, score = guided_with_score(
+        state, model, examples, x_input,
+        max_steps=max_search_steps, max_depth=max_depth)
 
-    if candidate is None:
-        print(f"  could not find composition for {name}")
+    # Hindsight feedback loop: learn from strong near-misses, then retry.
+    if candidate is not None and 0.90 < score < 0.999:
+        print(f"  [RL Feedback] Search found a strong near-miss (R^2={score:.4f}).")
+        print("  [RL Feedback] Updating TRM priors from this near-miss...")
+
+        fake_target = dict(candidate)
+        fake_target.pop("_score", None)
+        fake_task = {"target": fake_target, "examples": examples}
+        state["replay_buffer"].append(fake_task)
+
+        model.train()
+        for _ in range(5):
+            train_on_examples(
+                model, optimizer, examples, fake_target,
+                input_dim=input_dim, seq_len=seq_len,
+                num_epochs=1, n_sup=max(4, CONFIG["n_sup"] // 2),
+            )
+        state["replay_buffer"].pop()
+
+        print("  [RL Feedback] Priors updated. Retrying guided search...")
+        model.eval()
+        candidate, score = guided_with_score(
+            state, model, examples, x_input,
+            max_steps=max_search_steps, max_depth=max_depth,
+            temperature_boost=0.5,
+        )
+
+    if candidate is None or score < 0.999:
+        print(f"  could not find exact composition for {name}")
         return False, optimizer, 0.0
 
     constants = candidate.get("constants")
