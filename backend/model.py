@@ -94,20 +94,15 @@ class TRM(nn.Module):
             _Block(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)
         ])
 
+        # Normalization for recursion inputs to prevent NaN explosion
+        self.ln_recursion = nn.LayerNorm(d_model)
+
         # Output heads (read from y, the answer embedding)
         self.head_primary = nn.Linear(d_model, n_functions)
         self.head_secondary = nn.Linear(d_model, n_functions)
         self.head_tertiary = nn.Linear(d_model, n_functions)
         self.head_composition = nn.Linear(d_model, 4)   # none, seq, nested, parallel
         self.head_halt = nn.Linear(d_model, 1)
-
-        # Routing head: per-position relevance score (which input columns matter)
-        # Outputs sigmoid scores in [0, 1] for each input position.
-        # High score = column is relevant.  Initialized with positive bias
-        # so that by default ALL columns are selected (scores near 1.0).
-        self.head_routing = nn.Linear(d_model, seq_len)
-        with torch.no_grad():
-            self.head_routing.bias.fill_(2.0)  # sigmoid(2) ≈ 0.88 → default: use all
 
     def _apply_blocks(self, h: torch.Tensor) -> torch.Tensor:
         """Run input through all transformer blocks."""
@@ -124,11 +119,11 @@ class TRM(nn.Module):
         """
         # n steps: refine z given (x, y, z)
         for _ in range(self.n_recursions):
-            z = self._apply_blocks(x + y + z)
+            z = self._apply_blocks(self.ln_recursion(x + y + z))
 
         # 1 step: refine y given (y, z) — NO x, so the network knows
         # this is answer-refinement, not reasoning
-        y = self._apply_blocks(y + z)
+        y = self._apply_blocks(self.ln_recursion(y + z))
 
         return y, z
 
@@ -182,7 +177,6 @@ class TRM(nn.Module):
             "tertiary_logits":    self.head_tertiary(pooled),
             "composition_logits": self.head_composition(pooled),
             "halt_logits":        self.head_halt(pooled).squeeze(-1),
-            "routing_logits":     self.head_routing(pooled),
         }
 
         return new_carry, outputs

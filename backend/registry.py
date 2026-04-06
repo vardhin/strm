@@ -64,6 +64,7 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         # -- Control --
         "COND":  (3, _factory(lambda inp: inp[1] if inp[0] != 0 else inp[2])),
         "CONST": (1, _factory(lambda inp: inp[0])),
+        "NULL":  (1, _factory(lambda inp: 0)),  # column eraser: marks input as unused
 
         # -- Iteration (these need execute_fn) --
         "LOOP":  (-1, _loop_factory),

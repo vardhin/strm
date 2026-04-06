@@ -174,14 +174,14 @@ def main():
     print("  Input: [x, junk1, junk2]  — model must discover only col 0 matters\n")
 
     sq_train = []
-    for x in range(1, 8):
+    for x in range(1, 13):
         sq_train.append(([float(x), junk(), junk()], float(x * x)))
     create_dataset("n_sq_train", "x*x with junk cols", sq_train)
     train_function("SQUARE_N", "n_sq_train", max_depth=5, num_epochs=40,
                    max_search_steps=15)
 
     sq_test = []
-    for x in [8, 9, 10, 11, 12]:
+    for x in [10, 11, 12, 13, 14]:
         sq_test.append(([float(x), junk(), junk()], float(x * x)))
     create_dataset("n_sq_test", "square holdout with junk", sq_test)
     evaluate("n_sq_test")
@@ -196,7 +196,7 @@ def main():
     for m in [1, 2, 3, 4, 5, 6]:
         for a in [1, 2, 3, 4, 5]:
             f_train.append(([float(m), junk(), float(a), junk()], float(m * a)))
-    create_dataset("n_force_train", "F=m*a with junk", f_train[:15])
+    create_dataset("n_force_train", "F=m*a with junk", f_train[:24])
     train_function("FORCE_N", "n_force_train", max_depth=5, num_epochs=50,
                    max_search_steps=20)
 
@@ -223,7 +223,7 @@ def main():
         for v in [1, 2, 3, 4, 5]:
             ke = 0.5 * m * v * v
             ke_train.append(([float(m), noisy_correlated(m), float(v)], ke))
-    create_dataset("n_ke_train", "KE with correlated noise", ke_train[:18])
+    create_dataset("n_ke_train", "KE with correlated noise", ke_train[:25])
 
     ke_test = []
     for m in [4, 5, 6]:
@@ -249,7 +249,7 @@ def main():
         for h in [1, 2, 3, 4, 5, 6]:
             pe = m * g * h
             pe_train.append(([junk(), float(m), junk(), float(h)], pe))
-    create_dataset("n_pe_train", "PE with junk cols", pe_train[:20])
+    create_dataset("n_pe_train", "PE with junk cols", pe_train[:30])
 
     pe_test = []
     for m in [4, 5, 6]:
@@ -282,7 +282,7 @@ def main():
                     [float(m), junk(), float(v), junk(), float(h)],
                     ke + pe
                 ))
-    create_dataset("n_energy_train", "E=KE+PE with junk", energy_train[:30])
+    create_dataset("n_energy_train", "E=KE+PE with junk", energy_train[:48])
 
     energy_test = []
     for m in [3, 4, 5]:

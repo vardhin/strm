@@ -113,26 +113,68 @@ def build_composition(candidate: dict, input_arity: int,
 # Learning pipeline
 # ---------------------------------------------------------------------------
 
+def _init_replay_buffer(state: dict):
+    """Initialize the replay buffer with curriculum tasks if not already present."""
+    if "replay_buffer" not in state:
+        state["replay_buffer"] = list(curriculum_tasks(state))
+        print(f"  replay buffer initialized with {len(state['replay_buffer'])} curriculum tasks")
+
+
+def _is_duplicate_discovery(state: dict, candidate: dict) -> bool:
+    """Check if this candidate is structurally identical to an existing discovery.
+
+    Only considers it a duplicate if same function IDs, comp_type, AND routing.
+    MUL(x,y) is NOT the same as MUL(x,x) — different routing.
+    """
+    for entry in state.get("replay_buffer", []):
+        target = entry["target"]
+        if (target.get("primary_id") == candidate.get("primary_id") and
+            target.get("secondary_id") == candidate.get("secondary_id") and
+            target.get("tertiary_id") == candidate.get("tertiary_id") and
+            target.get("comp_type") == candidate.get("comp_type") and
+            target.get("routing") == candidate.get("routing") and
+            target.get("constants") == candidate.get("constants")):
+            return True
+    return False
+
+
 def learn(conn: sqlite3.Connection, state: dict, model: TRM,
           optimizer: torch.optim.Optimizer, name: str,
           examples: list[tuple[list, float | int]], *,
           max_search_steps: int = 10, max_depth: int = 3,
-          num_epochs: int = 30) -> tuple[bool, torch.optim.Optimizer, float]:
-    """Full pipeline: search -> simplify -> register -> resize -> train.
+          num_epochs: int = 30, max_retries: int = 2) -> tuple[bool, torch.optim.Optimizer, float]:
+    """Full pipeline: search -> simplify -> register -> replay train.
 
+    If search fails, re-trains on accumulated knowledge and retries.
     Returns (success, optimizer, r2_score).
     """
     input_dim = CONFIG["input_dim"]
     seq_len = CONFIG["seq_len"]
 
+    # Ensure replay buffer exists; pre-train if this is the first call
+    fresh = "replay_buffer" not in state
+    _init_replay_buffer(state)
+    if fresh:
+        print("  loading curriculum knowledge...")
+        train.train_on_replay(model, optimizer, state["replay_buffer"],
+                              input_dim=input_dim, seq_len=seq_len,
+                              epochs_per_task=2, n_sup=CONFIG["n_sup"])
+
     print(f"\n{'=' * 50}")
     print(f"Learning: {name}")
     print(f"{'=' * 50}")
 
-    # Phase 1: search (guided only — no exhaustive fallback)
+    # Search with retries: if search fails, re-train on what we know and try again
     x_input = search.format_examples(examples, input_dim=input_dim, seq_len=seq_len)
-    candidate = search.guided(state, model, examples, x_input,
-                              max_steps=max_search_steps, max_depth=max_depth)
+    candidate = None
+    for attempt in range(1 + max_retries):
+        candidate = search.guided(state, model, examples, x_input,
+                                  max_steps=max_search_steps, max_depth=max_depth,
+                                  temperature_boost=attempt * 1.0)
+        if candidate is not None:
+            break
+        if attempt < max_retries:
+            print(f"  search failed (attempt {attempt + 1}), retrying with higher temperature...")
 
     if candidate is None:
         print(f"  could not find composition for {name}")
@@ -145,32 +187,65 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
     else:
         print(f"  found: {_fmt_candidate(state, candidate)}")
 
-    # Phase 2: simplify (strips unused input columns)
+    # Phase 2: check for duplicate before doing any work
+    if _is_duplicate_discovery(state, candidate):
+        print(f"  duplicate of existing knowledge — skipping")
+        # Find existing fid by name
+        fid = None
+        for f, m in state["metadata"].items():
+            if m["name"] == name:
+                fid = f
+                break
+        if fid is not None:
+            r2 = exe.r_squared(state, fid, examples)
+            print(f"  verification: R²={r2:.6f}")
+            return r2 > 0.999, optimizer, r2
+        return True, optimizer, 1.0
+
+    # Phase 3: simplify (strips unused input columns)
     input_arity = len(examples[0][0])
     composition = build_composition(candidate, input_arity, state["loop_id"])
     composition, effective_arity, used_cols = simplify.simplify(
         state, composition, examples, constants, const_mode)
 
-    # Phase 3: register
+    # Phase 4: register
     old_vocab = reg.vocab_size(state)
     fid = reg.register_learned(conn, state, name, effective_arity, composition,
                                constants, const_mode)
-    # Store which original columns this function uses (for routing in compositions)
     if used_cols is not None:
         state["metadata"][fid]["used_cols"] = used_cols
     new_vocab = reg.vocab_size(state)
     print(f"  registered {name} as id={fid}")
 
-    # Phase 4: resize model if vocab grew
+    # Phase 5: resize model if vocab grew
     if new_vocab > old_vocab:
         resize_heads(model, old_vocab, new_vocab)
-        # Must create fresh optimizer — old one holds stale param references
         optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
 
-    # Phase 5: train
-    train.train_on_examples(model, optimizer, examples, candidate,
-                            input_dim=input_dim, seq_len=seq_len,
-                            num_epochs=num_epochs, n_sup=CONFIG["n_sup"])
+    state["replay_buffer"].append({
+        "examples": examples,
+        "target": dict(candidate),
+    })
+    # Also store clean version (stripped columns) if applicable
+    if used_cols is not None and len(used_cols) < input_arity:
+        clean_examples = [
+            ([inp[c] for c in used_cols], out)
+            for inp, out in examples
+        ]
+        clean_target = dict(candidate)
+        clean_target.pop("routing", None)
+        clean_target.pop("null_columns", None)
+        state["replay_buffer"].append({
+            "examples": clean_examples,
+            "target": clean_target,
+        })
+    print(f"  replay buffer: {len(state['replay_buffer'])} tasks")
+
+    # Phase 6: consolidate all knowledge — curriculum + all discoveries
+    print(f"  consolidating knowledge ({len(state['replay_buffer'])} known facts)...")
+    train.train_on_replay(model, optimizer, state["replay_buffer"],
+                          input_dim=input_dim, seq_len=seq_len,
+                          epochs_per_task=2, n_sup=CONFIG["n_sup"])
 
     # Verify (R² score) — use stripped examples if columns were removed
     if used_cols is not None:
@@ -188,7 +263,19 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
 # ---------------------------------------------------------------------------
 
 def curriculum_tasks(state: dict) -> list[dict]:
-    """Pre-training tasks: identity mappings for each primitive."""
+    """Known facts: examples for each primitive and composition type.
+
+    These are already-solved equations. The TRM loads them as knowledge
+    so it knows what functions do, how compositions work, and how to
+    use NULL to ignore junk columns.
+    """
+    import random as _rng
+    _rng_state = _rng.getstate()
+    _rng.seed(777)
+
+    def _junk():
+        return round(_rng.uniform(-100, 100), 2)
+
     tasks = []
 
     def _find(name):
@@ -196,6 +283,36 @@ def curriculum_tasks(state: dict) -> list[dict]:
             if m["name"] == name:
                 return fid
         return None
+
+    def _add_task(fid, examples):
+        """Add a clean task + a noisy variant with NULL columns."""
+        target = {
+            "primary_id": fid, "secondary_id": None,
+            "tertiary_id": None, "comp_type": "none",
+        }
+        # Clean version
+        tasks.append({"target": dict(target), "examples": examples})
+
+        # Noisy version: insert junk columns, teach TRM to use NULL
+        arity = len(examples[0][0])
+        if arity == 1:
+            # [x] -> [junk, x, junk] — NULL cols 0,2, route col 1
+            noisy_examples = [
+                ([_junk(), inp[0], _junk()], out) for inp, out in examples
+            ]
+            noisy_target = dict(target)
+            noisy_target["routing"] = [[1]]
+            noisy_target["null_columns"] = [0, 2]
+            tasks.append({"target": noisy_target, "examples": noisy_examples})
+        elif arity == 2:
+            # [a, b] -> [a, junk, b, junk] — NULL cols 1,3, route cols 0,2
+            noisy_examples = [
+                ([inp[0], _junk(), inp[1], _junk()], out) for inp, out in examples
+            ]
+            noisy_target = dict(target)
+            noisy_target["routing"] = [[0, 2]]
+            noisy_target["null_columns"] = [1, 3]
+            tasks.append({"target": noisy_target, "examples": noisy_examples})
 
     or_id = _find("OR")
     and_id = _find("AND")
@@ -207,30 +324,129 @@ def curriculum_tasks(state: dict) -> list[dict]:
     dec_id = _find("DEC")
 
     if or_id is not None:
-        tasks.append({"target": {"primary_id": or_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([2, 3], 2|3), ([1, 4], 1|4), ([0, 7], 0|7), ([5, 5], 5|5)]})
+        _add_task(or_id, [([2, 3], 2|3), ([1, 4], 1|4), ([0, 7], 0|7), ([5, 5], 5|5),
+                          ([6, 3], 6|3), ([3, 12], 3|12), ([7, 1], 7|1), ([4, 4], 4|4),
+                          ([2, 6], 2|6), ([1, 1], 1|1)])
     if and_id is not None:
-        tasks.append({"target": {"primary_id": and_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([2, 3], 2&3), ([1, 4], 1&4), ([7, 3], 7&3), ([5, 5], 5&5)]})
+        _add_task(and_id, [([2, 3], 2&3), ([1, 4], 1&4), ([7, 3], 7&3), ([5, 5], 5&5),
+                           ([6, 3], 6&3), ([3, 12], 3&12), ([7, 1], 7&1), ([4, 4], 4&4),
+                           ([2, 6], 2&6), ([1, 1], 1&1)])
     if not_id is not None:
-        tasks.append({"target": {"primary_id": not_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([0], ~0), ([1], ~1), ([5], ~5), ([7], ~7)]})
+        _add_task(not_id, [([0], ~0), ([1], ~1), ([5], ~5), ([7], ~7), ([3], ~3),
+                           ([2], ~2), ([4], ~4), ([6], ~6), ([8], ~8), ([10], ~10)])
     if add_id is not None:
-        tasks.append({"target": {"primary_id": add_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([0, 0], 0), ([1, 2], 3), ([5, 3], 8), ([7, 10], 17)]})
+        _add_task(add_id, [([0, 0], 0), ([1, 2], 3), ([5, 3], 8), ([7, 10], 17), ([4, 6], 10),
+                           ([3, 3], 6), ([8, 2], 10), ([6, 7], 13), ([2, 9], 11), ([1, 1], 2)])
     if sub_id is not None:
-        tasks.append({"target": {"primary_id": sub_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([5, 2], 3), ([10, 3], 7), ([7, 7], 0), ([8, 4], 4)]})
+        _add_task(sub_id, [([5, 2], 3), ([10, 3], 7), ([7, 7], 0), ([8, 4], 4), ([12, 5], 7),
+                           ([9, 1], 8), ([6, 3], 3), ([15, 8], 7), ([4, 2], 2), ([3, 3], 0)])
     if mul_id is not None:
-        tasks.append({"target": {"primary_id": mul_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([0, 5], 0), ([1, 5], 5), ([2, 3], 6), ([4, 5], 20)]})
+        _add_task(mul_id, [([0, 5], 0), ([1, 5], 5), ([2, 3], 6), ([4, 5], 20), ([3, 7], 21),
+                           ([2, 2], 4), ([5, 5], 25), ([3, 4], 12), ([6, 2], 12), ([1, 8], 8)])
     if inc_id is not None:
-        tasks.append({"target": {"primary_id": inc_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([0], 1), ([1], 2), ([5], 6), ([10], 11)]})
+        _add_task(inc_id, [([0], 1), ([1], 2), ([5], 6), ([10], 11), ([8], 9),
+                           ([3], 4), ([7], 8), ([12], 13), ([2], 3), ([15], 16)])
     if dec_id is not None:
-        tasks.append({"target": {"primary_id": dec_id, "secondary_id": None, "tertiary_id": None, "comp_type": "none"},
-                       "examples": [([1], 0), ([2], 1), ([6], 5), ([11], 10)]})
+        _add_task(dec_id, [([1], 0), ([2], 1), ([6], 5), ([11], 10), ([9], 8),
+                           ([4], 3), ([8], 7), ([13], 12), ([3], 2), ([16], 15)])
 
+    # --- Composition tasks: teach the TRM that compositions exist ---
+    # Without these, the model only ever sees comp_type="none" and never
+    # explores nested/sequential/parallel during search.
+
+    # Sequential: primary(secondary(inputs))
+    # INC(MUL(a, b)) = a*b + 1
+    if inc_id is not None and mul_id is not None:
+        tasks.append({
+            "target": {"primary_id": inc_id, "secondary_id": mul_id,
+                       "tertiary_id": None, "comp_type": "sequential"},
+            "examples": [([2, 3], 7), ([1, 5], 6), ([4, 2], 9), ([3, 3], 10), ([2, 6], 13),
+                         ([5, 1], 6), ([3, 4], 13), ([1, 1], 2), ([6, 2], 13), ([2, 5], 11)],
+        })
+    # DEC(ADD(a, b)) = a+b - 1
+    if dec_id is not None and add_id is not None:
+        tasks.append({
+            "target": {"primary_id": dec_id, "secondary_id": add_id,
+                       "tertiary_id": None, "comp_type": "sequential"},
+            "examples": [([2, 3], 4), ([5, 1], 5), ([4, 4], 7), ([10, 2], 11), ([3, 6], 8),
+                         ([1, 1], 1), ([7, 3], 9), ([2, 8], 9), ([6, 6], 11), ([4, 1], 4)],
+        })
+    # SUB(MUL(a, b)) = a*b - 1  (another sequential)
+    if dec_id is not None and mul_id is not None:
+        tasks.append({
+            "target": {"primary_id": dec_id, "secondary_id": mul_id,
+                       "tertiary_id": None, "comp_type": "sequential"},
+            "examples": [([2, 3], 5), ([1, 5], 4), ([4, 2], 7), ([3, 3], 8), ([5, 2], 9),
+                         ([2, 2], 3), ([3, 4], 11), ([1, 1], 0), ([6, 2], 11), ([4, 3], 11)],
+        })
+
+    # Nested: primary(secondary(x1), secondary(x2), ...)
+    # ADD(INC(a), INC(b)) = (a+1) + (b+1) = a+b+2
+    if add_id is not None and inc_id is not None:
+        tasks.append({
+            "target": {"primary_id": add_id, "secondary_id": inc_id,
+                       "tertiary_id": None, "comp_type": "nested"},
+            "examples": [([1, 2], 5), ([3, 4], 9), ([0, 0], 2), ([5, 5], 12), ([2, 7], 11),
+                         ([4, 1], 7), ([6, 3], 11), ([1, 1], 4), ([3, 8], 13), ([7, 2], 11)],
+        })
+    # MUL(DEC(a), DEC(b)) = (a-1) * (b-1)
+    if mul_id is not None and dec_id is not None:
+        tasks.append({
+            "target": {"primary_id": mul_id, "secondary_id": dec_id,
+                       "tertiary_id": None, "comp_type": "nested"},
+            "examples": [([3, 4], 6), ([5, 3], 8), ([2, 6], 5), ([4, 4], 9), ([6, 3], 10),
+                         ([7, 2], 6), ([3, 3], 4), ([2, 2], 1), ([5, 5], 16), ([4, 6], 15)],
+        })
+    # MUL(INC(a), INC(b)) = (a+1) * (b+1)  (another nested)
+    if mul_id is not None and inc_id is not None:
+        tasks.append({
+            "target": {"primary_id": mul_id, "secondary_id": inc_id,
+                       "tertiary_id": None, "comp_type": "nested"},
+            "examples": [([1, 2], 6), ([3, 4], 20), ([0, 0], 1), ([2, 2], 9), ([4, 1], 10),
+                         ([1, 5], 12), ([5, 3], 24), ([2, 1], 6), ([3, 3], 16), ([0, 4], 5)],
+        })
+
+    # Parallel: tertiary(primary(route1), secondary(route2))
+    # ADD(INC(a), MUL(b, c)) = (a+1) + b*c
+    if add_id is not None and inc_id is not None and mul_id is not None:
+        tasks.append({
+            "target": {"primary_id": inc_id, "secondary_id": mul_id,
+                       "tertiary_id": add_id, "comp_type": "parallel",
+                       "routing": [[0], [1, 2]]},
+            "examples": [([1, 2, 3], 8), ([0, 3, 4], 13), ([2, 1, 5], 8), ([3, 2, 2], 8),
+                         ([4, 3, 1], 8), ([1, 1, 1], 3), ([5, 2, 3], 12), ([0, 4, 2], 9),
+                         ([2, 3, 3], 12), ([3, 1, 4], 8)],
+        })
+    # SUB(MUL(a,b), ADD(a,b)) = a*b - (a+b)
+    if sub_id is not None and mul_id is not None and add_id is not None:
+        tasks.append({
+            "target": {"primary_id": mul_id, "secondary_id": add_id,
+                       "tertiary_id": sub_id, "comp_type": "parallel"},
+            "examples": [([3, 4], 5), ([5, 2], 3), ([4, 3], 5), ([6, 2], 4), ([3, 5], 7),
+                         ([2, 2], 0), ([4, 4], 8), ([7, 3], 11), ([5, 5], 15), ([2, 6], 4)],
+        })
+    # MUL(INC(a), MUL(b, c)) = (a+1) * b*c  — parallel with routing
+    if mul_id is not None and inc_id is not None:
+        tasks.append({
+            "target": {"primary_id": inc_id, "secondary_id": mul_id,
+                       "tertiary_id": mul_id, "comp_type": "parallel",
+                       "routing": [[0], [1, 2]]},
+            "examples": [([1, 2, 3], 12), ([0, 3, 4], 12), ([2, 1, 5], 15), ([3, 2, 2], 16),
+                         ([1, 4, 2], 16), ([0, 2, 5], 10), ([4, 1, 3], 15), ([2, 2, 2], 12),
+                         ([3, 3, 3], 36), ([1, 5, 1], 10)],
+        })
+    # ADD(MUL(a,b), MUL(a,c)) = a*b + a*c  — parallel, same col in both routes
+    if add_id is not None and mul_id is not None:
+        tasks.append({
+            "target": {"primary_id": mul_id, "secondary_id": mul_id,
+                       "tertiary_id": add_id, "comp_type": "parallel",
+                       "routing": [[0, 1], [0, 2]]},
+            "examples": [([2, 3, 4], 14), ([1, 5, 3], 8), ([3, 2, 1], 9), ([4, 1, 2], 12),
+                         ([2, 2, 3], 10), ([5, 1, 1], 10), ([3, 4, 2], 18), ([1, 1, 1], 2),
+                         ([2, 5, 5], 20), ([4, 3, 3], 24)],
+        })
+
+    _rng.setstate(_rng_state)
     return tasks
 
 

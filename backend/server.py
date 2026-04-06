@@ -36,7 +36,7 @@ import search
 import train
 import simplify
 from model import TRM, create_model, fresh_carry, resize_heads
-from main import build_composition, CONFIG, learn, curriculum_tasks
+from main import build_composition, CONFIG, learn, curriculum_tasks, _init_replay_buffer
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +445,7 @@ def train_single(req: TrainRequest):
         "target": req.target_name,
         "dataset": req.dataset_name,
         "success": ok,
-        "r2_score": round(r2, 6),
+        "r2_score": round(r2, 6) if math.isfinite(r2) else 0.0,
         "elapsed_s": round(elapsed, 2),
         "vocab_size": reg.vocab_size(env["state"]),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -462,17 +462,19 @@ def run_experiment(req: ExperimentRequest):
     env = _get_or_create_env(req.model_name)
     results = []
 
-    # Phase 1: curriculum pre-training
+    # Phase 1: curriculum pre-training via replay buffer
+    # The replay buffer is initialized with curriculum tasks and replayed
+    # fully on every learn() call, so we just ensure it's set up here.
     if req.pre_train:
-        tasks = curriculum_tasks(env["state"])
-        for task in tasks:
-            train.train_on_examples(
-                env["model"], env["optimizer"],
-                task["examples"], task["target"],
-                input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
-                num_epochs=req.pre_train_epochs, n_sup=CONFIG["n_sup"],
-            )
-        results.append({"phase": "pre_training", "tasks": len(tasks), "status": "done"})
+        _init_replay_buffer(env["state"])
+        n_tasks = len(env["state"]["replay_buffer"])
+        # Do an initial replay pass so the model learns the curriculum
+        train.train_on_replay(
+            env["model"], env["optimizer"], env["state"]["replay_buffer"],
+            input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
+            epochs_per_task=15, n_sup=CONFIG["n_sup"],
+        )
+        results.append({"phase": "pre_training", "tasks": n_tasks, "status": "done"})
 
     # Phase 2: progressive learning from datasets
     for item in req.curriculum:
@@ -498,7 +500,7 @@ def run_experiment(req: ExperimentRequest):
             "target": item.target_name,
             "dataset": item.dataset_name,
             "success": ok,
-            "r2_score": round(r2, 6),
+            "r2_score": round(r2, 6) if math.isfinite(r2) else 0.0,
             "elapsed_s": round(elapsed, 2),
         }
         results.append(record)

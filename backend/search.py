@@ -1,16 +1,17 @@
 """
 Program search for NSSR.
 
-Strategy: TRM-guided search with correlation-based column routing.
-The model predicts likely function compositions. Correlation heuristics
-identify which input columns actually matter. Constant fitting runs
-incrementally on promising near-misses.
+Strategy: TRM-guided search with NULL-based column elimination.
+The TRM predicts likely function compositions. Junk columns are handled
+by generating candidates that NULL out subsets of columns — the executor
+skips NULL'd columns and routes the remaining ones into functions
+(with same-column repetition allowed).
 
 Returns a candidate dict or None.
 """
 
 import math
-from itertools import combinations, combinations_with_replacement, permutations, product
+from itertools import product
 import torch
 from typing import Any
 
@@ -28,46 +29,24 @@ COMP_TYPES = ["none", "sequential", "nested", "parallel"]
 
 def guided(state: dict, model, examples: list[tuple[list[int], Any]],
            x_input: torch.Tensor, *, max_steps: int = 10,
-           max_depth: int = 3) -> dict | None:
-    """Use the TRM to predict likely compositions, then validate them.
-
-    First prunes junk columns (low correlation with output), then runs
-    TRM-guided search on the cleaned inputs. Constant fitting is attempted
-    incrementally on near-misses.
-    """
-    model.eval()
-    input_arity = len(examples[0][0])
-
-    # Prune junk columns: only keep columns with meaningful correlation
-    kept_cols = _prune_columns(examples, input_arity)
-    if len(kept_cols) < input_arity:
-        print(f"    [routing] pruned {input_arity} -> {len(kept_cols)} cols: {kept_cols}")
-        pruned_examples = [
-            ([inp[c] for c in kept_cols], out)
-            for inp, out in examples
-        ]
-        # Re-encode for the TRM
-        pruned_x = format_examples(pruned_examples,
-                                   input_dim=x_input.shape[-1],
-                                   seq_len=x_input.shape[1])
-        # Search on pruned inputs
-        result = _guided_inner(state, model, pruned_examples, pruned_x,
-                               max_steps=max_steps, max_depth=max_depth)
-        if result is not None:
-            # Remap routing back to original column indices
-            return _remap_candidate(result, kept_cols)
-
-        # If pruned search failed, fall through to full search
-        print(f"    [routing] pruned search failed, trying full input")
-
-    return _guided_inner(state, model, examples, x_input,
-                         max_steps=max_steps, max_depth=max_depth)
+           max_depth: int = 3, temperature_boost: float = 0.0) -> dict | None:
+    """Use the TRM to predict likely compositions, then validate them."""
+    result, _ = _guided_inner(state, model, examples, x_input,
+                              max_steps=max_steps, max_depth=max_depth,
+                              temperature_boost=temperature_boost)
+    return result
 
 
 def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
                   x_input: torch.Tensor, *, max_steps: int = 10,
-                  max_depth: int = 3) -> dict | None:
-    """Core search loop on (possibly pruned) examples."""
+                  max_depth: int = 3,
+                  temperature_boost: float = 0.0) -> tuple[dict | None, float]:
+    """Core search loop.
+
+    Returns (candidate, best_near_miss_r2). candidate is None if search failed.
+
+    Uses holdout validation and simplicity preference.
+    """
     model.eval()
 
     batch_size, seq_len, _ = x_input.shape
@@ -77,41 +56,48 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
     n_functions = reg.vocab_size(state)
     near_misses = []
     input_arity = len(examples[0][0])
+    null_id = _find_null_id(state)
 
-    # Pre-compute correlation subsets once (cheap, data-driven)
-    corr_subsets = _correlation_subsets(examples, input_arity)
+    # Holdout split
+    import random as _rng
+    shuffled = list(examples)
+    _rng.seed(12345)
+    _rng.shuffle(shuffled)
+    if len(examples) >= 5:
+        n_holdout = max(2, len(examples) // 3)
+        train_examples = shuffled[:-n_holdout]
+        holdout_examples = shuffled[-n_holdout:]
+    else:
+        train_examples = examples
+        holdout_examples = examples
+
+    # Pre-compute NULL column subsets: all ways to drop 0..N-1 columns
+    null_subsets = _null_column_subsets(input_arity)
 
     for step in range(max_steps):
         carry, outputs = model(carry, x_input)
 
-        # Average logits across batch, mask to valid vocab
+        temperature = max(2.0 - step * 0.05, 0.5) + temperature_boost
         logits = {
-            k: outputs[k].detach().mean(dim=0)[:n_functions]
+            k: outputs[k].detach().mean(dim=0)[:n_functions] / temperature
             for k in ("primary_logits", "secondary_logits", "tertiary_logits")
         }
-        comp_logits = outputs["composition_logits"].detach().mean(dim=0)
+        comp_logits = outputs["composition_logits"].detach().mean(dim=0) / temperature
 
-        # Routing: merge model predictions with correlation heuristic
-        routing_logits = outputs["routing_logits"].detach().mean(dim=0)
-        model_subsets = _routing_subsets_from_scores(
-            routing_logits[:input_arity], input_arity)
-        routing_subsets = model_subsets[:]
-        for s in corr_subsets:
-            if s not in routing_subsets:
-                routing_subsets.append(s)
-        routing_subsets = routing_subsets[:8]
-
-        # Top-k predictions (grows with step for diversity)
-        top_k = min(3 + step, n_functions)
+        # Top-k predictions (grows with step for diversity, wider on retries)
+        top_k = min(3 + step + int(temperature_boost * 2), n_functions)
         tops = {k: torch.topk(v, min(top_k, len(v))).indices for k, v in logits.items()}
         comp_top = torch.topk(comp_logits, min(len(COMP_TYPES), len(comp_logits))).indices
 
-        # Generate and deduplicate candidates
+        # Log TRM thought process
+        _log_trm_step(state, step, logits, comp_logits, n_functions)
+
+        # Generate candidates (with NULL column variants)
         candidates = _generate_candidates(state, tops, comp_top, max_depth,
-                                          input_arity,
-                                          routing_subsets=routing_subsets)
+                                          input_arity, null_subsets, null_id)
 
         new_count = 0
+        valid_candidates = []
         for cand in candidates:
             key = _cand_key(cand)
             if key in tried:
@@ -119,173 +105,199 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
             tried.add(key)
             new_count += 1
 
-            if exe.validate(state, cand, examples):
-                return cand
-            near_misses.append(cand)
+            if exe.validate(state, cand, train_examples) and \
+               exe.validate(state, cand, holdout_examples):
+                valid_candidates.append(cand)
+            else:
+                near_misses.append(cand)
 
-        # Incremental constant fitting on this step's candidates (capped)
+        # If we found valid candidates, return the simplest one
+        if valid_candidates:
+            best = min(valid_candidates, key=_complexity_score)
+            return best, 1.0
+
+        # Incremental constant fitting
         step_misses = near_misses[-new_count:] if new_count > 0 else []
-        fitted = _try_fit_any(state, step_misses[:50], examples)
-        if fitted is not None:
-            return fitted
+        fitted = _try_fit_any(state, step_misses[:50], train_examples)
+        if fitted is not None and exe.validate(state, fitted, holdout_examples):
+            return fitted, 1.0
 
         # Small noise on carry for exploration
         with torch.no_grad():
             carry.y = carry.y + torch.randn_like(carry.y) * 0.01
             carry.z = carry.z + torch.randn_like(carry.z) * 0.01
 
-    # Targeted pass: try all learned functions with correlation-guided routing.
-    # This catches compositions the TRM hasn't learned to predict yet.
-    fitted = _targeted_learned_search(state, examples, input_arity, corr_subsets)
-    if fitted is not None:
-        return fitted
+    # Final pass: constant fitting on near misses
+    fitted = _try_fit_any(state, near_misses[:200], train_examples)
+    if fitted is not None and exe.validate(state, fitted, holdout_examples):
+        return fitted, 1.0
 
-    # Final pass: constant fitting on near misses (capped)
-    return _try_fit_any(state, near_misses[:200], examples)
-
-
-# ---------------------------------------------------------------------------
-# Targeted search over learned functions
-# ---------------------------------------------------------------------------
-
-def _targeted_learned_search(state: dict, examples: list[tuple[list, Any]],
-                              input_arity: int,
-                              corr_subsets: list[list[int]]) -> dict | None:
-    """Try compositions using learned + key primitive functions with routing.
-
-    This is a small focused search — NOT exhaustive over all functions.
-    Only tries learned functions and a few key primitives (MUL, ADD, CONST,
-    DIV) in parallel/sequential/nested compositions with correlation-guided
-    routing. Tries constant fitting on each candidate immediately.
-    """
-    loop_id = state["loop_id"]
-
-    # Collect learned functions and key primitives
-    learned = []
-    key_primitives = []
-    for fid, meta in state["metadata"].items():
-        if fid == loop_id or meta["arity"] < 1:
-            continue
-        if meta["layer"] > 0:
-            learned.append(fid)
-        elif meta["name"] in ("MUL", "ADD", "SUB", "CONST", "DIV"):
-            key_primitives.append(fid)
-
-    pool = learned + key_primitives
-    if not pool:
-        return None
-
-    near_misses = []
-    tried = set()
-
-    def _try(cand):
-        key = _cand_key(cand)
-        if key in tried:
-            return None
-        tried.add(key)
-        if exe.validate(state, cand, examples):
-            return cand
-        near_misses.append(cand)
-        return None
-
-    # 1. Single learned functions with routing + constants
-    for fid in pool:
-        meta = state["metadata"].get(fid)
-        if meta is None:
-            continue
-        arity = meta["arity"]
-        # Try with all columns
-        result = _try(_candidate(fid))
-        if result:
-            return result
-        # Try with routed subsets (exact size match)
-        for subset in corr_subsets:
-            if len(subset) == arity and len(subset) != input_arity:
-                result = _try(_candidate(fid, comp_type="none", routing=[subset]))
-                if result:
-                    return result
-        # Try permutation-based routing from top correlated columns
-        if arity < input_arity and arity <= 4:
-            top_cols = set()
-            for s in corr_subsets[:3]:
-                top_cols.update(s)
-            top_cols = sorted(top_cols)[:min(len(top_cols), 5)]
-            perm_count = 0
-            for perm in product(top_cols, repeat=arity):
-                route = list(perm)
-                result = _try(_candidate(fid, comp_type="none", routing=[route]))
-                if result:
-                    return result
-                perm_count += 1
-                if perm_count >= 50:
+    # Score best near miss
+    best_r2 = -1.0
+    if near_misses:
+        _log_near_misses(state, near_misses, examples)
+        for cand in near_misses:
+            produced, expected = [], []
+            for inputs, exp in examples:
+                try:
+                    got = exe.run(state, cand, inputs)
+                    produced.append(float(got))
+                    expected.append(float(exp))
+                except Exception:
                     break
+            if len(produced) == len(examples):
+                best_r2 = max(best_r2, _r2(expected, produced))
 
-    # Constant fitting on single-function candidates
-    fitted = _try_fit_any(state, near_misses, examples)
-    if fitted:
-        return fitted
-    near_misses.clear()
+    return None, best_r2
 
-    # 2. Sequential compositions: primary(secondary(routed_inputs))
-    for pid in pool:
-        for sid in pool:
-            meta_s = state["metadata"].get(sid)
-            if meta_s is None:
-                continue
-            # Full inputs
-            result = _try(_candidate(pid, sid, comp_type="sequential"))
-            if result:
-                return result
-            # Routed
-            for subset in corr_subsets:
-                if len(subset) == meta_s["arity"] and len(subset) != input_arity:
-                    result = _try(_candidate(pid, sid, comp_type="sequential",
-                                             routing=[subset]))
-                    if result:
-                        return result
 
-    fitted = _try_fit_any(state, near_misses[:100], examples)
-    if fitted:
-        return fitted
-    near_misses.clear()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-    # 3. Parallel: tid(pid(routed), sid(routed))
-    combiners = [fid for fid in pool
-                 if state["metadata"].get(fid, {}).get("arity") == 2]
-    par_misses = []
-    par_total = 0
-    for pid in pool:
-        meta_p = state["metadata"].get(pid)
-        if meta_p is None:
-            continue
-        arity_p = meta_p["arity"]
-        if arity_p < 1 or arity_p > input_arity:
-            continue
-        for sid in pool:
-            meta_s = state["metadata"].get(sid)
-            if meta_s is None:
-                continue
-            arity_s = meta_s["arity"]
-            if arity_s < 1 or arity_s > input_arity:
-                continue
-            for tid in combiners:
-                batch = []
-                _add_parallel_routed_from_subsets(
-                    batch, pid, sid, tid, "parallel",
-                    arity_p, arity_s, input_arity, corr_subsets,
-                    max_routings=100)
-                for cand in batch:
-                    result = _try(cand)
-                    if result:
-                        return result
-                    par_misses.append(cand)
-                par_total += len(batch)
+def _log_trm_step(state: dict, step: int, logits: dict,
+                  comp_logits: torch.Tensor, n_functions: int):
+    """Log what the TRM is thinking at each search step."""
+    def _top_names(key, k=5):
+        vals, idxs = torch.topk(logits[key], min(k, len(logits[key])))
+        probs = torch.softmax(logits[key], dim=0)
+        parts = []
+        for v, i in zip(vals, idxs):
+            name = state["metadata"].get(i.item(), {}).get("name", f"#{i.item()}")
+            p = probs[i].item()
+            parts.append(f"{name}({p:.2f})")
+        return ", ".join(parts)
 
-    print(f"    [targeted] parallel: {par_total} candidates, {len(par_misses)} misses, fitting...")
-    fitted = _try_fit_any(state, par_misses[:200], examples)
-    if fitted:
-        return fitted
+    comp_probs = torch.softmax(comp_logits, dim=0)
+    comp_ranked = torch.argsort(comp_probs, descending=True)
+    comp_parts = []
+    for i in comp_ranked:
+        if i.item() < len(COMP_TYPES):
+            comp_parts.append(f"{COMP_TYPES[i.item()]}({comp_probs[i].item():.2f})")
+    comp_str = ", ".join(comp_parts)
 
+    print(f"    [step {step}] primary:   {_top_names('primary_logits')}")
+    print(f"    [step {step}] secondary: {_top_names('secondary_logits')}")
+    print(f"    [step {step}] tertiary:  {_top_names('tertiary_logits')}")
+    print(f"    [step {step}] comp:      {comp_str}")
+
+
+def _log_near_misses(state: dict, near_misses: list[dict],
+                     examples: list[tuple[list, Any]], top_n: int = 5):
+    """Score and log the best near misses from the TRM search."""
+    scored = []
+    for cand in near_misses:
+        produced = []
+        expected = []
+        for inputs, exp in examples:
+            try:
+                got = exe.run(state, cand, inputs)
+                produced.append(float(got))
+                expected.append(float(exp))
+            except Exception:
+                break
+        if len(produced) == len(examples):
+            r2 = _r2(expected, produced)
+            scored.append((r2, cand))
+
+    scored.sort(key=lambda x: -x[0])
+    best = scored[:top_n]
+
+    if not best:
+        return
+
+    print(f"    [near misses] {len(scored)} candidates scored, top {len(best)}:")
+    for r2, cand in best:
+        print(f"      R²={r2:.6f}  {_describe_candidate(state, cand)}")
+
+
+def _describe_candidate(state: dict, cand: dict) -> str:
+    """Human-readable description of a candidate."""
+    pid = cand["primary_id"]
+    sid = cand.get("secondary_id")
+    tid = cand.get("tertiary_id")
+    comp = cand["comp_type"]
+    routing = cand.get("routing")
+    null_cols = cand.get("null_columns")
+
+    p_name = state["metadata"].get(pid, {}).get("name", f"#{pid}")
+    s_name = state["metadata"].get(sid, {}).get("name", f"#{sid}") if sid is not None else None
+    t_name = state["metadata"].get(tid, {}).get("name", f"#{tid}") if tid is not None else None
+
+    routing_str = ""
+    if routing:
+        routing_str = f"  route={routing}"
+    if null_cols:
+        routing_str += f"  null={null_cols}"
+
+    consts = cand.get("constants")
+    const_str = ""
+    if consts:
+        mode = cand.get("const_mode", "multiplicative")
+        const_str = f"  [k={consts}, {mode}]"
+
+    if comp == "none":
+        return f"{p_name}{routing_str}{const_str}"
+    elif comp == "sequential":
+        return f"{p_name}({s_name}(...)){routing_str}{const_str}"
+    elif comp == "nested":
+        return f"{p_name}({s_name}(each)){routing_str}{const_str}"
+    elif comp == "parallel":
+        return f"{t_name}({p_name}(...), {s_name}(...)){routing_str}{const_str}"
+    else:
+        return f"{comp}({p_name}, {s_name}){routing_str}{const_str}"
+
+
+# ---------------------------------------------------------------------------
+# NULL column subsets
+# ---------------------------------------------------------------------------
+
+def _null_column_subsets(input_arity: int, max_null: int = 0) -> list[list[int]]:
+    """Generate all useful subsets of columns to keep (others get NULL'd).
+
+    Returns list of kept-column lists. Always includes "keep all" and
+    single-column subsets. For 2+ columns, includes all pairs.
+    Max NULL columns defaults to input_arity - 1 (keep at least 1).
+    """
+    if max_null == 0:
+        max_null = input_arity - 1
+
+    all_cols = list(range(input_arity))
+    subsets = [all_cols]  # keep all (no NULLs)
+
+    if input_arity <= 1:
+        return subsets
+
+    # Single columns (NULL everything else)
+    for c in range(input_arity):
+        subset = [c]
+        if subset not in subsets:
+            subsets.append(subset)
+
+    # Pairs
+    if input_arity >= 3:
+        from itertools import combinations
+        for pair in combinations(range(input_arity), 2):
+            subset = list(pair)
+            if subset not in subsets:
+                subsets.append(subset)
+
+    # Triples (for 4+ column inputs)
+    if input_arity >= 4:
+        from itertools import combinations
+        for triple in combinations(range(input_arity), 3):
+            subset = list(triple)
+            if subset not in subsets:
+                subsets.append(subset)
+
+    return subsets
+
+
+def _find_null_id(state: dict) -> int | None:
+    """Find the NULL primitive's function id."""
+    for fid, meta in state["metadata"].items():
+        if meta["name"] == "NULL":
+            return fid
     return None
 
 
@@ -294,14 +306,14 @@ def _targeted_learned_search(state: dict, examples: list[tuple[list, Any]],
 # ---------------------------------------------------------------------------
 
 def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
-                         max_depth: int, input_arity: int = 2,
-                         routing_subsets: list[list[int]] | None = None
-                         ) -> list[dict]:
-    """Build candidate dicts from top-k predictions at each depth.
+                         max_depth: int, input_arity: int,
+                         null_subsets: list[list[int]],
+                         null_id: int | None) -> list[dict]:
+    """Build candidate dicts from top-k TRM predictions.
 
-    routing_subsets: model-predicted column subsets to try (from head_routing).
-    Each subset is a list of column indices, e.g. [0, 2] means "use cols 0 and 2".
-    The "all columns" subset is always included.
+    For each function/composition, tries all NULL column subsets.
+    Remaining (non-NULL) columns get routed into functions with
+    same-column repetition allowed.
     """
     candidates = []
     loop_id = state["loop_id"]
@@ -311,16 +323,35 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
     tertiary_ids = tops["tertiary_logits"].tolist()
     comp_types_predicted = [COMP_TYPES[i] for i in comp_top.tolist() if i < len(COMP_TYPES)]
 
-    # Depth 1: single functions (with routing)
+    # Filter out NULL from function predictions (it's not used as a composition function)
+    if null_id is not None:
+        primary_ids = [x for x in primary_ids if x != null_id]
+        secondary_ids = [x for x in secondary_ids if x != null_id]
+        tertiary_ids = [x for x in tertiary_ids if x != null_id]
+
+    # Depth 1: single functions with NULL column variants
     for pid in primary_ids:
-        candidates.append(_candidate(pid))
-        _add_routed_variants(candidates, state, pid, None, None,
-                             "none", input_arity, routing_subsets)
+        meta = state["metadata"].get(pid)
+        if meta is None:
+            continue
+        arity = meta["arity"]
+
+        for kept in null_subsets:
+            null_cols = [c for c in range(input_arity) if c not in kept]
+            # Route kept columns into function slots (with repetition)
+            if len(kept) == arity:
+                candidates.append(_candidate(pid, routing=[kept],
+                                             null_columns=null_cols or None))
+            elif len(kept) > 0 and arity > 0:
+                # Need to fill `arity` slots from `kept` columns
+                for combo in product(kept, repeat=arity):
+                    candidates.append(_candidate(pid, routing=[list(combo)],
+                                                 null_columns=null_cols or None))
 
     if max_depth < 2:
         return candidates
 
-    # Depth 2: binary compositions
+    # Depth 2: binary compositions with NULL column variants
     for comp in comp_types_predicted:
         if comp == "none":
             continue
@@ -330,20 +361,20 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
             for sid in secondary_ids:
                 if sid == loop_id:
                     continue
+
                 if comp == "parallel":
                     for tid in tertiary_ids:
                         if tid == loop_id:
                             continue
                         _add_parallel_candidates(
                             candidates, state, pid, sid, tid,
-                            input_arity, comp,
-                            routing_subsets=routing_subsets)
+                            input_arity, comp, null_subsets)
                 else:
-                    candidates.append(_candidate(pid, sid, comp_type=comp))
-                    _add_routed_variants(candidates, state, pid, sid, None,
-                                         comp, input_arity, routing_subsets)
+                    _add_composition_candidates(
+                        candidates, state, pid, sid, comp,
+                        input_arity, null_subsets)
 
-    # Depth 2: LOOP candidates (unary + binary body)
+    # Depth 2: LOOP candidates
     if loop_id is not None:
         for body_id in primary_ids + secondary_ids:
             if body_id == loop_id:
@@ -357,9 +388,10 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
     if max_depth < 3:
         return candidates
 
-    # Depth 3: use learned functions if the TRM suggests them
-    learned = [fid for fid in primary_ids + secondary_ids
-               if state["metadata"].get(fid, {}).get("layer", 0) > 0]
+    # Depth 3: use ALL learned functions (not just TRM-predicted ones,
+    # since TRM may not know them well enough yet to predict them)
+    learned = [fid for fid, meta in state["metadata"].items()
+               if meta.get("layer", 0) > 0]
 
     if loop_id is not None:
         for lid in learned:
@@ -380,64 +412,64 @@ def _generate_candidates(state: dict, tops: dict, comp_top: torch.Tensor,
                     for tid in tertiary_ids:
                         _add_parallel_candidates(
                             candidates, state, lid, pid, tid,
-                            input_arity, comp,
-                            routing_subsets=routing_subsets)
+                            input_arity, comp, null_subsets)
             else:
                 for pid in primary_ids:
                     if pid == loop_id:
                         continue
-                    candidates.append(_candidate(pid, lid, comp_type=comp))
-                    _add_routed_variants(candidates, state, pid, lid, None,
-                                         comp, input_arity, routing_subsets)
+                    _add_composition_candidates(
+                        candidates, state, pid, lid, comp,
+                        input_arity, null_subsets)
 
     return candidates
 
 
-def _add_routed_variants(candidates: list, state: dict,
-                         pid: int, sid: int | None, tid: int | None,
-                         comp: str, input_arity: int,
-                         routing_subsets: list[list[int]] | None):
-    """Add routed variants of a candidate for non-parallel comp types.
-
-    For each model-suggested column subset, check if the function arities
-    match and create a routed candidate. Skips the "all columns" subset
-    since that's already the default candidate.
-    """
-    if routing_subsets is None or input_arity <= 1:
+def _add_composition_candidates(candidates: list, state: dict,
+                                pid: int, sid: int, comp: str,
+                                input_arity: int,
+                                null_subsets: list[list[int]]):
+    """Add sequential/nested candidates with NULL column variants."""
+    meta_p = state["metadata"].get(pid)
+    meta_s = state["metadata"].get(sid)
+    if meta_p is None or meta_s is None:
         return
-    if comp in ("parallel", "loop_direct", "loop_binary"):
+    if meta_p["arity"] < 0 or meta_s["arity"] < 0:
         return
 
-    for subset in routing_subsets:
-        if len(subset) == input_arity:
+    # Default: no NULL, all columns used
+    candidates.append(_candidate(pid, sid, comp_type=comp))
+
+    if input_arity <= 1:
+        return
+
+    for kept in null_subsets:
+        if len(kept) == input_arity:
+            continue  # already added as default
+        if len(kept) == 0:
             continue
+        null_cols = [c for c in range(input_arity) if c not in kept]
 
-        subset_arity = len(subset)
-
-        if comp == "none":
-            meta = state["metadata"].get(pid)
-            if meta and meta["arity"] == subset_arity:
-                candidates.append(_candidate(pid, comp_type="none",
-                                             routing=[subset]))
-
-        elif comp == "sequential":
-            meta_s = state["metadata"].get(sid)
-            if meta_s and meta_s["arity"] == subset_arity:
-                candidates.append(_candidate(pid, sid, comp_type="sequential",
-                                             routing=[subset]))
-
+        if comp == "sequential":
+            # secondary takes the kept columns, primary takes the result
+            arity_s = meta_s["arity"]
+            if arity_s > 0:
+                for combo in product(kept, repeat=arity_s):
+                    candidates.append(_candidate(pid, sid, comp_type=comp,
+                                                 routing=[list(combo)],
+                                                 null_columns=null_cols))
         elif comp == "nested":
-            meta_p = state["metadata"].get(pid)
-            if meta_p and meta_p["arity"] == subset_arity:
-                candidates.append(_candidate(pid, sid, comp_type="nested",
-                                             routing=[subset]))
+            # primary(secondary(x1), secondary(x2), ...) for each kept col
+            candidates.append(_candidate(pid, sid, comp_type=comp,
+                                         routing=[kept],
+                                         null_columns=null_cols))
 
 
 def _add_parallel_candidates(candidates: list, state: dict,
                              pid: int, sid: int, tid: int,
                              input_arity: int, comp: str,
-                             routing_subsets: list[list[int]] | None = None):
-    """Add parallel candidates with routing guided by routing_subsets."""
+                             null_subsets: list[list[int]],
+                             max_routings: int = 30):
+    """Add parallel candidates with NULL column variants."""
     meta_p = state["metadata"].get(pid)
     meta_s = state["metadata"].get(sid)
     if meta_p is None or meta_s is None:
@@ -445,58 +477,25 @@ def _add_parallel_candidates(candidates: list, state: dict,
 
     arity_p = meta_p["arity"]
     arity_s = meta_s["arity"]
-
-    if arity_p == input_arity and arity_s == input_arity:
-        candidates.append(_candidate(pid, sid, tid, comp_type=comp))
+    if arity_p < 0 or arity_s < 0:
         return
-
-    if 0 < arity_p <= input_arity and 0 < arity_s <= input_arity:
-        if routing_subsets is not None:
-            _add_parallel_routed_from_subsets(
-                candidates, pid, sid, tid, comp,
-                arity_p, arity_s, input_arity, routing_subsets)
-        else:
-            # No guidance — try a limited set of routings
-            seen = set()
-            for route_p, route_s in _generate_routings(input_arity, arity_p, arity_s):
-                key = (tuple(route_p), tuple(route_s))
-                if key not in seen:
-                    seen.add(key)
-                    candidates.append(_candidate(pid, sid, tid, comp_type=comp,
-                                                 routing=[route_p, route_s]))
-                if len(seen) >= 20:
-                    break
-
-
-def _add_parallel_routed_from_subsets(candidates: list,
-                                       pid: int, sid: int, tid: int,
-                                       comp: str,
-                                       arity_p: int, arity_s: int,
-                                       input_arity: int,
-                                       routing_subsets: list[list[int]],
-                                       max_routings: int = 25):
-    """Generate parallel routing candidates guided by model-predicted subsets.
-
-    Caps total routings per function triple to keep search fast.
-    """
     seen = set()
-    # Sort subsets smallest-first so focused routing gets tried before
-    # the combinatorial explosion of larger pools burns the cap.
-    sorted_subsets = sorted(routing_subsets, key=len)
-    for subset in sorted_subsets:
-        if len(subset) < max(arity_p, arity_s):
-            continue  # pool too small for either branch, skip
-        # Use product (with replacement + ordering) to allow same-column
-        # routing (e.g. MUL(x[2], x[2]) for squaring) and correct
-        # positional ordering for composed functions.
-        for combo_p in product(subset, repeat=arity_p):
-            for combo_s in product(subset, repeat=arity_s):
-                key = (combo_p, combo_s)
+
+    for kept in null_subsets:
+        if len(kept) == 0:
+            continue
+        null_cols = [c for c in range(input_arity) if c not in kept]
+
+        for combo_p in product(kept, repeat=arity_p):
+            for combo_s in product(kept, repeat=arity_s):
+                key = (combo_p, combo_s, tuple(null_cols) if null_cols else ())
                 if key in seen:
                     continue
                 seen.add(key)
-                candidates.append(_candidate(pid, sid, tid, comp_type=comp,
-                                             routing=[list(combo_p), list(combo_s)]))
+                candidates.append(_candidate(
+                    pid, sid, tid, comp_type=comp,
+                    routing=[list(combo_p), list(combo_s)],
+                    null_columns=null_cols or None))
                 if len(seen) >= max_routings:
                     return
 
@@ -508,7 +507,7 @@ def _add_parallel_routed_from_subsets(candidates: list,
 def _try_fit_constants(state: dict, cand: dict,
                        examples: list[tuple[list, Any]],
                        r2_threshold: float = 0.999) -> dict | None:
-    """Try fitting a single multiplicative constant into a candidate."""
+    """Try fitting a single multiplicative or additive constant."""
     produced = []
     expected = []
     for inputs, exp in examples:
@@ -539,7 +538,7 @@ def _try_fit_constants(state: dict, cand: dict,
 
 def _try_fit_any(state: dict, candidates: list[dict],
                   examples: list[tuple[list, Any]]) -> dict | None:
-    """Try constant-fitting on a list of candidates. Return best match or None."""
+    """Try constant-fitting on a list of candidates."""
     for cand in candidates:
         fitted = _try_fit_constants(state, cand, examples)
         if fitted is not None:
@@ -573,215 +572,49 @@ def _r2(actual: list[float], predicted: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Column pruning
-# ---------------------------------------------------------------------------
-
-def _prune_columns(examples: list[tuple[list, Any]], input_arity: int,
-                   tolerance: float = 0.1) -> list[int]:
-    """Return indices of columns with abs(correlation) >= tolerance.
-
-    Columns below the tolerance are junk — they contribute nothing to
-    the output. Pruning them shrinks the search space dramatically.
-    Always keeps at least 1 column (the highest-correlated).
-    """
-    if input_arity <= 1 or len(examples) < 3:
-        return list(range(input_arity))
-
-    n = len(examples)
-    outputs = [float(examples[i][1]) for i in range(n)]
-    out_mean = sum(outputs) / n
-    out_std = max(1e-12, (sum((y - out_mean)**2 for y in outputs) / n) ** 0.5)
-
-    correlations = []
-    for c in range(input_arity):
-        vals = [float(examples[i][0][c]) for i in range(n)]
-        c_mean = sum(vals) / n
-        c_std = max(1e-12, (sum((x - c_mean)**2 for x in vals) / n) ** 0.5)
-        cov = sum((vals[i] - c_mean) * (outputs[i] - out_mean)
-                  for i in range(n)) / n
-        correlations.append(abs(cov / (c_std * out_std)))
-
-    kept = [c for c in range(input_arity) if correlations[c] >= tolerance]
-
-    # Always keep at least the top column
-    if not kept:
-        best = max(range(input_arity), key=lambda c: correlations[c])
-        kept = [best]
-
-    return kept
-
-
-def _remap_candidate(candidate: dict, kept_cols: list[int]) -> dict:
-    """Remap a candidate's routing from pruned indices back to original indices.
-
-    If the candidate has routing like [[0, 1], [0, 2]] and kept_cols is
-    [0, 2, 4], the remapped routing is [[0, 2], [0, 4]].
-
-    If no routing, add one that maps kept_cols to the function inputs.
-    """
-    remapped = dict(candidate)
-    routing = candidate.get("routing")
-    if routing:
-        remapped["routing"] = [
-            [kept_cols[i] for i in route]
-            for route in routing
-        ]
-    else:
-        # No routing = function uses all pruned columns in order.
-        # Remap to original indices so executor picks the right columns.
-        comp = candidate["comp_type"]
-        if comp == "none":
-            remapped["routing"] = [kept_cols]
-        elif comp == "sequential":
-            remapped["routing"] = [kept_cols]
-        elif comp == "parallel":
-            remapped["routing"] = [kept_cols, kept_cols]
-    return remapped
-
-
-# ---------------------------------------------------------------------------
-# Input routing
-# ---------------------------------------------------------------------------
-
-def _routing_subsets_from_scores(scores: torch.Tensor, input_arity: int,
-                                 threshold: float = 0.5,
-                                 max_subsets: int = 6) -> list[list[int]]:
-    """Convert per-column relevance scores into a small set of column subsets."""
-    probs = torch.sigmoid(scores)
-    all_cols = list(range(input_arity))
-
-    subsets = [all_cols]
-
-    if input_arity <= 1:
-        return subsets
-
-    relevant = [i for i in all_cols if probs[i].item() > threshold]
-    if 0 < len(relevant) < input_arity:
-        subsets.append(relevant)
-
-    ranked = torch.argsort(probs).tolist()
-    for drop_idx in ranked:
-        subset = [i for i in all_cols if i != drop_idx]
-        if subset not in subsets:
-            subsets.append(subset)
-        if len(subsets) >= max_subsets:
-            break
-
-    if input_arity >= 3:
-        top2 = torch.topk(probs, min(2, input_arity)).indices.tolist()
-        top2.sort()
-        if top2 not in subsets:
-            subsets.append(top2)
-
-    return subsets[:max_subsets]
-
-
-def _correlation_subsets(examples: list[tuple[list, Any]], input_arity: int,
-                         max_subsets: int = 6) -> list[list[int]]:
-    """Generate column subsets by ranking columns on correlation with output.
-
-    Fast statistical heuristic — computes abs(correlation) between each
-    input column and the output, then generates top-k subsets.
-    """
-    if input_arity <= 1 or len(examples) < 3:
-        return [list(range(input_arity))]
-
-    n = len(examples)
-    cols = []
-    for c in range(input_arity):
-        vals = [float(examples[i][0][c]) for i in range(n)]
-        cols.append(vals)
-    outputs = [float(examples[i][1]) for i in range(n)]
-
-    out_mean = sum(outputs) / n
-    out_std = max(1e-12, (sum((y - out_mean)**2 for y in outputs) / n) ** 0.5)
-
-    correlations = []
-    for c in range(input_arity):
-        c_mean = sum(cols[c]) / n
-        c_std = max(1e-12, (sum((x - c_mean)**2 for x in cols[c]) / n) ** 0.5)
-        cov = sum((cols[c][i] - c_mean) * (outputs[i] - out_mean)
-                  for i in range(n)) / n
-        correlations.append(abs(cov / (c_std * out_std)))
-
-    ranked = sorted(range(input_arity), key=lambda i: -correlations[i])
-
-    all_cols = list(range(input_arity))
-    subsets = [all_cols]
-
-    # Top-k subsets for k = 1, 2, ..., input_arity-1
-    for k in range(1, input_arity):
-        subset = sorted(ranked[:k])
-        if subset not in subsets:
-            subsets.append(subset)
-        if len(subsets) >= max_subsets:
-            break
-
-    # Also generate all pairs from top-3 correlated columns
-    if input_arity >= 3:
-        top3 = ranked[:min(3, input_arity)]
-        for pair in combinations(top3, 2):
-            subset = sorted(pair)
-            if subset not in subsets:
-                subsets.append(subset)
-            if len(subsets) >= max_subsets:
-                break
-
-    return subsets[:max_subsets]
-
-
-def _generate_routings(input_arity: int, arity_p: int, arity_s: int
-                       ) -> list[tuple[list[int], list[int]]]:
-    """Generate ways to route inputs to two sub-functions.
-
-    Uses product to allow same-column routing and correct positional
-    ordering (e.g. MUL(x[i], x[i]) for squaring). Capped to avoid
-    combinatorial explosion.
-    """
-    all_indices = list(range(input_arity))
-    routings = []
-    for combo_p in product(all_indices, repeat=arity_p):
-        for combo_s in product(all_indices, repeat=arity_s):
-            routings.append((list(combo_p), list(combo_s)))
-            if len(routings) >= 200:
-                return routings
-    return routings
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _candidate(primary_id: int, secondary_id: int | None = None,
                tertiary_id: int | None = None, *,
                comp_type: str = "none",
-               routing: list[list[int]] | None = None) -> dict:
+               routing: list[list[int]] | None = None,
+               null_columns: list[int] | None = None) -> dict:
     return {
         "primary_id": primary_id,
         "secondary_id": secondary_id,
         "tertiary_id": tertiary_id,
         "comp_type": comp_type,
         "routing": routing,
+        "null_columns": null_columns,
     }
+
+
+def _complexity_score(c: dict) -> int:
+    """Lower = simpler = preferred."""
+    comp_scores = {"none": 0, "sequential": 1, "nested": 1,
+                   "parallel": 2, "loop_direct": 3, "loop_binary": 3}
+    score = comp_scores.get(c["comp_type"], 2)
+    if c.get("secondary_id") is not None:
+        score += 1
+    if c.get("tertiary_id") is not None:
+        score += 1
+    if c.get("constants"):
+        score += 1
+    return score
 
 
 def _cand_key(c: dict) -> tuple:
     routing = c.get("routing")
     routing_key = tuple(tuple(r) for r in routing) if routing else None
+    null_key = tuple(c.get("null_columns") or [])
     return (c["primary_id"], c["secondary_id"], c.get("tertiary_id"),
-            c["comp_type"], routing_key)
+            c["comp_type"], routing_key, null_key)
 
 
 def format_examples(examples: list[tuple[list, Any]], *,
                     input_dim: int, seq_len: int) -> torch.Tensor:
-    """Encode examples as float vectors for the TRM.
-
-    Each input value is placed at position 0 of its input_dim-sized slot,
-    with a magnitude encoding spread across a few additional dimensions
-    for richer signal.
-
-    Returns: (batch_size, seq_len, input_dim) float tensor.
-    """
+    """Encode examples as float vectors for the TRM."""
     batch_size = len(examples)
     data = torch.zeros(batch_size, seq_len, input_dim, dtype=torch.float32)
 
