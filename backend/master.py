@@ -582,7 +582,7 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
 
         # Incremental constant fitting
         step_misses = near_misses[-new_count:] if new_count > 0 else []
-        fitted = _try_fit_any(state, step_misses[:50], train_examples)
+        fitted = _try_fit_any(state, step_misses, train_examples)
         if fitted is not None and exe.validate(state, fitted, holdout_examples):
             return fitted, 1.0
 
@@ -592,7 +592,7 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
             carry.z = carry.z + torch.randn_like(carry.z) * 0.01
 
     # Final pass: constant fitting on near misses
-    fitted = _try_fit_any(state, near_misses[:200], train_examples)
+    fitted = _try_fit_any(state, near_misses, train_examples)
     if fitted is not None and exe.validate(state, fitted, holdout_examples):
         return fitted, 1.0
 
@@ -1504,7 +1504,6 @@ def learn(conn: sqlite3.Connection, state: dict, model,
 # ---------------------------------------------------------------------------
 # Curriculum & Targets (Abridged data loops)
 # ---------------------------------------------------------------------------
-
 def curriculum_tasks(state: dict) -> list[dict]:
     import random as _rng
     _rng_state = _rng.getstate()
@@ -1541,6 +1540,10 @@ def curriculum_tasks(state: dict) -> list[dict]:
     mul_id = _find("MUL")
     inc_id = _find("INC")
     dec_id = _find("DEC")
+    square_id = _find("SQUARE")
+    inverse_id = _find("MULTIPLICATIVE_INV")
+    abs_id = _find("ABS")
+    div_id = _find("DIV")  # <-- Added DIV 
 
     if or_id is not None: _add_task(or_id, [([2, 3], 2|3), ([1, 4], 1|4), ([0, 7], 0|7)])
     if and_id is not None: _add_task(and_id, [([2, 3], 2&3), ([1, 4], 1&4), ([7, 3], 7&3)])
@@ -1550,7 +1553,18 @@ def curriculum_tasks(state: dict) -> list[dict]:
     if mul_id is not None: _add_task(mul_id, [([0, 5], 0), ([1, 5], 5), ([2, 3], 6)])
     if inc_id is not None: _add_task(inc_id, [([0], 1), ([1], 2), ([5], 6)])
     if dec_id is not None: _add_task(dec_id, [([1], 0), ([2], 1), ([6], 5)])
+    
+    # FIX: Use higher numbers so SQUARE distinctively stands out from INC/MUL
+    if square_id is not None: _add_task(square_id, [([2], 4), ([3], 9), ([5], 25)])
+    
+    if inverse_id is not None: _add_task(inverse_id, [([1], 1.0), ([-2], -0.5), ([4], 0.25)])
+    
+    if abs_id is not None: _add_task(abs_id, [([-3], 3), ([0], 0), ([5], 5)])
+    
+    # ADDED: Network needs to know what DIV is so it can divide by 2 for Kinetic Energy (0.5)
+    if div_id is not None: _add_task(div_id, [([10, 2], 5.0), ([9, 3], 3.0), ([5, 2], 2.5)])
 
+    # --- Compositional Base ---
     if inc_id is not None and mul_id is not None:
         tasks.append({
             "target": {"primary_id": inc_id, "secondary_id": mul_id, "tertiary_id": None, "comp_type": "sequential"},
@@ -1566,6 +1580,7 @@ def curriculum_tasks(state: dict) -> list[dict]:
             "target": {"primary_id": inc_id, "secondary_id": mul_id, "tertiary_id": add_id, "comp_type": "parallel", "routing": [[0], [1, 2]]},
             "examples": [([1, 2, 3], 8), ([0, 3, 4], 13), ([2, 1, 5], 8)],
         })
+        
     _rng.setstate(_rng_state)
     return tasks
 
@@ -1657,22 +1672,6 @@ def main():
                           input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
                           num_epochs=20, n_sup=CONFIG["n_sup"])
 
-    print("\n--- PART 1: DUMMY COLUMNS (zero signal) ---")
-
-    # Step 2: SQUARE with dummy columns
-    print("\n[Step 2] SQUARE(x) = x*x with 2 junk columns [x, junk1, junk2]")
-    sq_train = [([float(x), junk(), junk()], float(x * x)) for x in range(1, 13)]
-    _, optimizer, _ = learn(conn, state, model, optimizer, "SQUARE_N", sq_train, 
-                            max_depth=5, num_epochs=40, max_search_steps=15)
-
-    # Step 3: FORCE with dummy columns
-    print("\n[Step 3] FORCE(m,a) = m*a with junk columns interleaved [m, junk1, a, junk2]")
-    f_train = [([float(m), junk(), float(a), junk()], float(m * a)) 
-               for m in [1, 2, 3, 4, 5, 6] for a in [1, 2, 3, 4, 5]]
-    _, optimizer, _ = learn(conn, state, model, optimizer, "FORCE_N", f_train[:24], 
-                            max_depth=5, num_epochs=50, max_search_steps=20)
-
-
     print("\n--- PART 2: NOISY / CORRELATED COLUMNS ---")
     
     # Step 4: KE with a correlated noise column
@@ -1680,15 +1679,16 @@ def main():
     ke_train = [([float(m), noisy_correlated(m), float(v)], 0.5 * m * v * v) 
                 for m in [1, 2, 3, 4, 5] for v in [1, 2, 3, 4, 5]]
     _, optimizer, _ = learn(conn, state, model, optimizer, "KE_N", ke_train[:25], 
-                            max_depth=5, num_epochs=50, max_search_steps=20)
-
+                            max_depth=5, num_epochs=50, max_search_steps=100)
+    
+    """
     # Step 5: PE with junk columns on both sides
     print("\n[Step 5] PE(m,h) = m*9.81*h with junk on both sides [junk, m, junk, h]")
     g = 9.81
     pe_train = [([junk(), float(m), junk(), float(h)], m * g * h) 
                 for m in [1, 2, 3, 4, 5] for h in [1, 2, 3, 4, 5, 6]]
     _, optimizer, _ = learn(conn, state, model, optimizer, "PE_N", pe_train[:30], 
-                            max_depth=5, num_epochs=50, max_search_steps=20)
+                            max_depth=5, num_epochs=50, max_search_steps=100)
 
 
     print("\n--- PART 3: SYNTHESIS WITH NOISE ---")
@@ -1704,8 +1704,8 @@ def main():
                 energy_train.append(([float(m), junk(), float(v), junk(), float(h)], ke + pe))
                 
     _, optimizer, _ = learn(conn, state, model, optimizer, "TOTAL_E_N", energy_train[:48], 
-                            max_depth=5, num_epochs=60, max_search_steps=25)
-                            
+                            max_depth=5, num_epochs=60, max_search_steps=100)
+    """
     print("\n--- Experiment Complete ---")
     save_checkpoint(model, optimizer, state)
     db.print_summary(conn)

@@ -49,6 +49,9 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         "MUL":   (2, _factory(lambda inp: inp[0] * inp[1])),
         "INC":   (1, _factory(lambda inp: inp[0] + 1)),
         "DEC":   (1, _factory(lambda inp: inp[0] - 1)),
+        "SQUARE":(1, _factory(lambda inp: inp[0] * inp[0])),
+        "MULTIPLICATIVE_INV": (1, _factory(lambda inp: 1 / inp[0] if inp[0] != 0 else 0.0)),
+        "ABS":   (1, _factory(lambda inp: abs(inp[0]))),
 
         # -- Division (float) --
         "DIV":   (2, _factory(lambda inp: inp[0] / inp[1] if inp[1] != 0 else 0.0)),
