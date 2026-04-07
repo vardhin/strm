@@ -13,10 +13,77 @@ Registry state shape:
     }
 """
 
+import math
 import sqlite3
 from typing import Any
 
 import db
+
+
+EPSILON = 1e-5
+MAX_EXP_INPUT = 60.0
+
+
+def _to_finite(value: Any) -> float:
+    """Convert to float and collapse NaN/inf to 0.0 for safe math ops."""
+    v = float(value)
+    return v if math.isfinite(v) else 0.0
+
+
+def safe_sqrt(x: Any) -> float:
+    """Safe sqrt(abs(x)) to avoid domain errors on negatives."""
+    return math.sqrt(abs(_to_finite(x)))
+
+
+def safe_div(x: Any, y: Any) -> float:
+    """Safe divide that returns 0.0 near zero denominator."""
+    num = _to_finite(x)
+    den = _to_finite(y)
+    if abs(den) < EPSILON:
+        return 0.0
+    return num / den
+
+
+def safe_log(x: Any) -> float:
+    """Safe log(abs(x)) with near-zero guard."""
+    v = _to_finite(x)
+    if abs(v) < EPSILON:
+        return 0.0
+    return math.log(abs(v))
+
+
+def safe_tan(x: Any) -> float:
+    """Safe tan using sin/cos with a cosine guard."""
+    v = _to_finite(x)
+    cos_v = math.cos(v)
+    if abs(cos_v) < EPSILON:
+        return 0.0
+    return math.sin(v) / cos_v
+
+
+def safe_sec(x: Any) -> float:
+    """Safe sec = 1/cos(x) with a cosine guard."""
+    v = _to_finite(x)
+    cos_v = math.cos(v)
+    if abs(cos_v) < EPSILON:
+        return 0.0
+    return 1.0 / cos_v
+
+
+def safe_cosec(x: Any) -> float:
+    """Safe cosec = 1/sin(x) with a sine guard."""
+    v = _to_finite(x)
+    sin_v = math.sin(v)
+    if abs(sin_v) < EPSILON:
+        return 0.0
+    return 1.0 / sin_v
+
+
+def safe_exp(x: Any) -> float:
+    """Safe exp with input clamping to prevent overflow."""
+    v = _to_finite(x)
+    v = max(-MAX_EXP_INPUT, min(MAX_EXP_INPUT, v))
+    return math.exp(v)
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +121,7 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         "ABS":   (1, _factory(lambda inp: abs(inp[0]))),
 
         # -- Division (float) --
-        "DIV":   (2, _factory(lambda inp: inp[0] / inp[1] if inp[1] != 0 else 0.0)),
+        "DIV":   (2, _factory(lambda inp: safe_div(inp[0], inp[1]))),
 
         # -- Comparison --
         "LT":    (2, _factory(lambda inp: int(inp[0] < inp[1]))),
@@ -73,6 +140,16 @@ def _make_primitives() -> dict[str, tuple[int, Any]]:
         "LOOP":  (-1, _loop_factory),
         "WHILE": (-1, _while_factory),
         "ACCUM": (-1, _accum_factory),
+
+        # -- Safe non-linear --
+        "LOG":   (1, _factory(lambda inp: safe_log(inp[0]))),
+        "SQRT":  (1, _factory(lambda inp: safe_sqrt(inp[0]))),
+        "SIN":   (1, _factory(lambda inp: math.sin(_to_finite(inp[0])))),
+        "COS":   (1, _factory(lambda inp: math.cos(_to_finite(inp[0])))),
+        "TAN":   (1, _factory(lambda inp: safe_tan(inp[0]))),
+        "SEC":   (1, _factory(lambda inp: safe_sec(inp[0]))),
+        "COSEC": (1, _factory(lambda inp: safe_cosec(inp[0]))),
+        "EXP":   (1, _factory(lambda inp: safe_exp(inp[0]))),
     }
 
 

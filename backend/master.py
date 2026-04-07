@@ -1143,49 +1143,39 @@ def _cand_key(c: dict) -> tuple:
 
 def format_examples(examples: list[tuple[list, Any]], *,
                     input_dim: int, seq_len: int) -> torch.Tensor:
-    """Encode examples for the TRM with batch-wise Z-score normalization.
-
-    Input columns are normalized independently across the batch, and the
-    normalized target is written as an extra sequence token so the model can
-    condition on the desired output pattern.
-    """
+    """Encode examples as 7D float vectors WITHOUT destructive Z-Score normalization."""
     batch_size = len(examples)
     data = torch.zeros(batch_size, seq_len, input_dim, dtype=torch.float32)
 
-    if batch_size == 0 or seq_len == 0:
+    if batch_size == 0:
         return data
 
     input_arity = len(examples[0][0])
 
-    # Collect per-column values plus targets for normalization across batch.
-    cols = [[float(ex[0][i]) for ex in examples] for i in range(input_arity)]
-    targets = [float(ex[1]) for ex in examples]
-
-    def z_score(vals: list[float]) -> list[float]:
-        mean_v = sum(vals) / len(vals)
-        var_v = sum((v - mean_v) ** 2 for v in vals) / len(vals)
-        std_v = math.sqrt(var_v) + 1e-8
-        return [(v - mean_v) / std_v for v in vals]
-
-    norm_cols = [z_score(c) for c in cols]
-    norm_targets = z_score(targets)
-
     for b in range(batch_size):
-        # Write normalized inputs.
+        # 1. Write TRUE inputs (Preserves physical ratios like v/c)
         for pos in range(min(input_arity, seq_len - 1)):
-            val = norm_cols[pos][b]
+            val = float(examples[b][0][pos])
             data[b, pos, 0] = val
             data[b, pos, 1] = 1.0 if val >= 0 else -1.0
             data[b, pos, 2] = math.log1p(abs(val))
             data[b, pos, 3] = val - int(val) if val >= 0 else -(abs(val) - int(abs(val)))
+            # Non-linear geometry features
+            data[b, pos, 4] = math.sqrt(abs(val))
+            data[b, pos, 5] = math.sin(val)
+            data[b, pos, 6] = math.cos(val)
 
-        # Write normalized target as the next token.
+        # 2. Write TRUE target output
         target_pos = min(input_arity, seq_len - 1)
-        t_val = norm_targets[b]
+        t_val = float(examples[b][1])
         data[b, target_pos, 0] = t_val
         data[b, target_pos, 1] = 1.0 if t_val >= 0 else -1.0
         data[b, target_pos, 2] = math.log1p(abs(t_val))
         data[b, target_pos, 3] = t_val - int(t_val) if t_val >= 0 else -(abs(t_val) - int(abs(t_val)))
+        # Non-linear target features
+        data[b, target_pos, 4] = math.sqrt(abs(t_val))
+        data[b, target_pos, 5] = math.sin(t_val)
+        data[b, target_pos, 6] = math.cos(t_val)
 
     return data
 
@@ -1417,7 +1407,7 @@ def noisy_correlated(val):
 # ---------------------------------------------------------------------------
 
 CONFIG = {
-    "input_dim": 32,
+    "input_dim": 7,
     "seq_len": 8,
     "d_model": 128,
     "n_heads": 8,
@@ -1635,6 +1625,13 @@ def curriculum_tasks(state: dict) -> list[dict]:
             if m["name"] == name: return fid
         return None
 
+    def _find_any(names: list[str]):
+        for name in names:
+            fid = _find(name)
+            if fid is not None:
+                return fid
+        return None
+
     def _add_task(fid, examples):
         target = {"primary_id": fid, "secondary_id": None, "tertiary_id": None, "comp_type": "none"}
         tasks.append({"target": dict(target), "examples": examples})
@@ -1662,6 +1659,18 @@ def curriculum_tasks(state: dict) -> list[dict]:
     inverse_id = _find("MULTIPLICATIVE_INV")
     abs_id = _find("ABS")
     div_id = _find("DIV")  # <-- Added DIV 
+    log_id = _find("LOG")
+    sqrt_id = _find("SQRT")
+    sin_id = _find("SIN")
+    cos_id = _find("COS")
+    tan_id = _find("TAN")
+    sec_id = _find("SEC")
+    cosec_id = _find("COSEC")
+    exp_id = _find("EXP")
+
+    ke_id = _find_any(["KE_N", "KE"])
+    pe_id = _find_any(["PE_N", "PE"])
+    te_id = _find_any(["TOTAL_E_N", "TOTAL_E", "TE"])
 
     if or_id is not None: _add_task(or_id, [([2, 3], 2|3), ([1, 4], 1|4), ([0, 7], 0|7)])
     if and_id is not None: _add_task(and_id, [([2, 3], 2&3), ([1, 4], 1&4), ([7, 3], 7&3)])
@@ -1682,6 +1691,24 @@ def curriculum_tasks(state: dict) -> list[dict]:
     # ADDED: Network needs to know what DIV is so it can divide by 2 for Kinetic Energy (0.5)
     if div_id is not None: _add_task(div_id, [([10, 2], 5.0), ([9, 3], 3.0), ([5, 2], 2.5)])
 
+    # Safe non-linear primitives
+    if log_id is not None: _add_task(log_id, [([1.0], 0.0), ([math.e], 1.0), ([-10.0], math.log(10.0))])
+    if sqrt_id is not None: _add_task(sqrt_id, [([4.0], 2.0), ([-9.0], 3.0), ([0.0], 0.0)])
+    if sin_id is not None: _add_task(sin_id, [([0.0], 0.0), ([math.pi / 2], 1.0), ([math.pi], 0.0)])
+    if cos_id is not None: _add_task(cos_id, [([0.0], 1.0), ([math.pi / 2], 0.0), ([math.pi], -1.0)])
+    if tan_id is not None: _add_task(tan_id, [([0.0], 0.0), ([math.pi / 4], 1.0), ([-math.pi / 4], -1.0)])
+    if sec_id is not None: _add_task(sec_id, [([0.0], 1.0), ([math.pi / 3], 2.0), ([math.pi], -1.0)])
+    if cosec_id is not None: _add_task(cosec_id, [([math.pi / 2], 1.0), ([math.pi / 6], 2.0), ([-math.pi / 2], -1.0)])
+    if exp_id is not None: _add_task(exp_id, [([0.0], 1.0), ([1.0], math.e), ([-1.0], math.exp(-1.0))])
+
+    # Previously learned equations should stay in curriculum once discovered.
+    if ke_id is not None:
+        _add_task(ke_id, [([1.0, 2.0], 2.0), ([2.0, 3.0], 9.0), ([4.0, 5.0], 50.0)])
+    if pe_id is not None:
+        _add_task(pe_id, [([1.0, 2.0], 19.62), ([2.0, 3.0], 58.86), ([4.0, 5.0], 196.2)])
+    if te_id is not None:
+        _add_task(te_id, [([1.0, 2.0, 3.0], 31.43), ([2.0, 3.0, 4.0], 96.48), ([3.0, 4.0, 5.0], 171.15)])
+
     # --- Compositional Base ---
     if inc_id is not None and mul_id is not None:
         tasks.append({
@@ -1697,6 +1724,86 @@ def curriculum_tasks(state: dict) -> list[dict]:
         tasks.append({
             "target": {"primary_id": inc_id, "secondary_id": mul_id, "tertiary_id": add_id, "comp_type": "parallel", "routing": [[0], [1, 2]]},
             "examples": [([1, 2, 3], 8), ([0, 3, 4], 13), ([2, 1, 5], 8)],
+        })
+
+    # --- Generic composition-shape curriculum (non-physics) ---
+    # Nested 1: "Root-Sum" -> SQRT(ADD(x, y))
+    if sqrt_id is not None and add_id is not None:
+        tasks.append({
+            "target": {"primary_id": sqrt_id, "secondary_id": add_id, "tertiary_id": None, "comp_type": "nested"},
+            "examples": [
+                ([1.0, 3.0], math.sqrt(4.0)),
+                ([10.0, 15.0], math.sqrt(25.0)),
+                ([0.2, 0.7], math.sqrt(0.9)),
+            ],
+        })
+
+    # Nested 2: "Asymptotic Difference" -> INV(SUB(1, x))
+    # Represent 1 as an explicit first input column so SUB has both args.
+    if inverse_id is not None and sub_id is not None:
+        tasks.append({
+            "target": {"primary_id": inverse_id, "secondary_id": sub_id, "tertiary_id": None, "comp_type": "nested"},
+            "examples": [
+                ([1.0, 0.5], 1.0 / (1.0 - 0.5)),
+                ([1.0, 0.8], 1.0 / (1.0 - 0.8)),
+                ([1.0, -2.0], 1.0 / (1.0 - (-2.0))),
+            ],
+        })
+
+    # Sequential 1: "Shifted Polynomial" -> SQUARE(INC(x))
+    if square_id is not None and inc_id is not None:
+        tasks.append({
+            "target": {"primary_id": square_id, "secondary_id": inc_id, "tertiary_id": None, "comp_type": "sequential"},
+            "examples": [
+                ([2.0], (2.0 + 1.0) ** 2),
+                ([4.0], (4.0 + 1.0) ** 2),
+                ([-3.0], (-3.0 + 1.0) ** 2),
+            ],
+        })
+
+    # Sequential 2: "Absolute Difference" -> ABS(SUB(x, y))
+    if abs_id is not None and sub_id is not None:
+        tasks.append({
+            "target": {"primary_id": abs_id, "secondary_id": sub_id, "tertiary_id": None, "comp_type": "sequential"},
+            "examples": [
+                ([5.0, 8.0], abs(5.0 - 8.0)),
+                ([10.0, 3.0], abs(10.0 - 3.0)),
+                ([-2.0, -5.0], abs(-2.0 - (-5.0))),
+            ],
+        })
+
+    # Parallel 1: "Pythagorean Expansion" -> ADD(SQUARE(x), SQUARE(y))
+    if add_id is not None and square_id is not None:
+        tasks.append({
+            "target": {
+                "primary_id": square_id,
+                "secondary_id": square_id,
+                "tertiary_id": add_id,
+                "comp_type": "parallel",
+                "routing": [[0], [1]],
+            },
+            "examples": [
+                ([3.0, 4.0], 3.0 ** 2 + 4.0 ** 2),
+                ([1.0, 2.0], 1.0 ** 2 + 2.0 ** 2),
+                ([5.0, 12.0], 5.0 ** 2 + 12.0 ** 2),
+            ],
+        })
+
+    # Parallel 2: "Wave Interference" -> MUL(SIN(x), COS(y))
+    if mul_id is not None and sin_id is not None and cos_id is not None:
+        tasks.append({
+            "target": {
+                "primary_id": sin_id,
+                "secondary_id": cos_id,
+                "tertiary_id": mul_id,
+                "comp_type": "parallel",
+                "routing": [[0], [1]],
+            },
+            "examples": [
+                ([0.0, 0.0], math.sin(0.0) * math.cos(0.0)),
+                ([math.pi / 2, math.pi], math.sin(math.pi / 2) * math.cos(math.pi)),
+                ([math.pi / 4, 0.0], math.sin(math.pi / 4) * math.cos(0.0)),
+            ],
         })
         
     _rng.setstate(_rng_state)
@@ -1773,7 +1880,9 @@ def main():
     print("NSSR — Neuro-Symbolic Recursive Regression\n")
 
     conn = db.init_db(os.path.join(CONFIG["checkpoint_dir"], "symbolic.db"))
-    state = reg.init_registry(conn)
+    state = reg.load_registry(conn)
+    if reg.vocab_size(state) == 0:
+        state = reg.init_registry(conn)
     print(f"primitives: {list(reg.get_names(state, list(state['metadata'].keys())))}\n")
 
     n_funcs = reg.vocab_size(state)
@@ -1790,39 +1899,17 @@ def main():
                           input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
                           num_epochs=20, n_sup=CONFIG["n_sup"])
 
-    print("\n--- PART 2: NOISY / CORRELATED COLUMNS ---")
-    
-    # Step 4: KE with a correlated noise column
-    print("\n[Step 4] KE(m,v) = 0.5*m*v² with correlated noise column [m, noise_correlated, v]")
-    ke_train = [([float(m), noisy_correlated(m), float(v)], 0.5 * m * v * v) 
-                for m in [1, 2, 3, 4, 5] for v in [1, 2, 3, 4, 5]]
-    _, optimizer, _ = learn(conn, state, model, optimizer, "KE_N", ke_train[:25], 
-                            max_depth=5, num_epochs=50, max_search_steps=60)
-    
-    
-    # Step 5: PE with junk columns on both sides
-    print("\n[Step 5] PE(m,h) = m*9.81*h with junk on both sides [junk, m, junk, h]")
-    g = 9.81
-    pe_train = [([junk(), float(m), junk(), float(h)], m * g * h) 
-                for m in [1, 2, 3, 4, 5] for h in [1, 2, 3, 4, 5, 6]]
-    _, optimizer, _ = learn(conn, state, model, optimizer, "PE_N", pe_train[:30], 
-                            max_depth=5, num_epochs=50, max_search_steps=60)
+    print("\n--- Next Feynman Equation ---")
+    print("\n Lorentz Factor: gamma(v, c) = 1 / sqrt(1 - v^2 / c^2)")
+    lorentz_train = []
+    for c in [3.0, 5.0, 10.0, 20.0]:
+        for frac in [-0.9, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9]:
+            v = frac * c
+            gamma = 1.0 / math.sqrt(1.0 - (v * v) / (c * c))
+            lorentz_train.append(([v, c], gamma))
 
-
-    print("\n--- PART 3: SYNTHESIS WITH NOISE ---")
-
-    # Step 6: TOTAL_E with noise
-    print("\n[Step 6] E(m,v,h) = KE + PE with junk columns [m, junk, v, junk, h]")
-    energy_train = []
-    for m in [1, 2, 3, 4]:
-        for v in [1, 2, 3, 4]:
-            for h in [1, 2, 3]:
-                ke = 0.5 * m * v * v
-                pe = m * g * h
-                energy_train.append(([float(m), junk(), float(v), junk(), float(h)], ke + pe))
-                
-    _, optimizer, _ = learn(conn, state, model, optimizer, "TOTAL_E_N", energy_train[:48], 
-                            max_depth=5, num_epochs=60, max_search_steps=60)
+    _, optimizer, _ = learn(conn, state, model, optimizer, "LORENTZ_FACTOR", lorentz_train,
+                            max_depth=6, num_epochs=80, max_search_steps=80)
     
     print("\n--- Experiment Complete ---")
     save_checkpoint(model, optimizer, state)
