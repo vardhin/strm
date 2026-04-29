@@ -10,12 +10,16 @@ the core pipeline code. Provides endpoints for:
   - Testing:     evaluate models against example sets, compare models
 """
 
+import asyncio
 import math
 import os
 import csv
 import io
 import json
+import queue
 import sqlite3
+import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -454,6 +458,112 @@ def train_single(req: TrainRequest):
     _experiments.append(record)
 
     return record
+
+
+@app.post("/train/stream")
+async def train_stream(req: TrainRequest):
+    """Like /train but streams Server-Sent Events with live progress.
+
+    SSE event types (matched to frontend expectations):
+      event: start  data: {"target_name": ..., "dataset_name": ...}
+      event: log    data: {"line": "..."}
+      event: done   data: {success, r2_score, elapsed_s, vocab_size, ...}
+      event: error  data: {"message": "..."}
+    """
+    if req.dataset_name not in _datasets:
+        raise HTTPException(404, f"Dataset '{req.dataset_name}' not found")
+
+    env = _get_or_create_env(req.model_name)
+    examples = _datasets[req.dataset_name]["examples"]
+
+    log_q: queue.Queue = queue.Queue()
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    # Thread-local stdout capture: only intercepts prints from this thread.
+    _local = threading.local()
+
+    class _ThreadLocalWriter(io.TextIOBase):
+        def write(self, s: str) -> int:
+            if threading.current_thread() is _local.thread:
+                if s and s.strip():
+                    log_q.put(s.rstrip("\n"))
+            else:
+                _real_stdout.write(s)
+            return len(s)
+        def flush(self):
+            _real_stdout.flush()
+
+    _real_stdout = sys.stdout
+
+    db_path = os.path.join(env["ckpt_dir"], "symbolic.db")
+
+    def _run():
+        _local.thread = threading.current_thread()
+        old = sys.stdout
+        sys.stdout = _ThreadLocalWriter()
+        thread_conn = db.init_db(db_path)
+        try:
+            t0 = time.time()
+            ok, env["optimizer"], r2 = learn(
+                thread_conn, env["state"], env["model"], env["optimizer"],
+                req.target_name, examples,
+                max_search_steps=req.max_search_steps,
+                max_depth=req.max_depth,
+                num_epochs=req.num_epochs,
+            )
+            elapsed = time.time() - t0
+            _save_env_checkpoint(env)
+            # Refresh main-thread connection so it sees new rows written by learn()
+            env["conn"].close()
+            env["conn"] = db.init_db(db_path)
+            record = {
+                "model_name": req.model_name,
+                "target": req.target_name,
+                "dataset": req.dataset_name,
+                "success": ok,
+                "r2_score": round(r2, 6) if math.isfinite(r2) else 0.0,
+                "elapsed_s": round(elapsed, 2),
+                "vocab_size": reg.vocab_size(env["state"]),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            env["train_history"].append(record)
+            _experiments.append(record)
+            log_q.put(("done", record))
+        except Exception as e:
+            log_q.put(("error", str(e)))
+        finally:
+            thread_conn.close()
+            sys.stdout = old
+            log_q.put(None)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    async def _event_generator():
+        yield _sse("start", {"target_name": req.target_name, "dataset_name": req.dataset_name})
+        while True:
+            # Non-blocking poll so the event loop stays responsive
+            try:
+                item = log_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+            if item is None:
+                break
+            if isinstance(item, str):
+                yield _sse("log", {"line": item})
+            elif item[0] == "done":
+                yield _sse("done", item[1])
+            elif item[0] == "error":
+                yield _sse("error", {"message": item[1]})
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/train/experiment")
