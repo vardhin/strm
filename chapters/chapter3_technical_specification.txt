@@ -1,0 +1,175 @@
+                         3. TECHNICAL SPECIFICATION
+
+3.1 Requirements
+
+                      Table 4. Consolidated Requirements Summary
+
+  Category          Representative Requirement
+
+  Functional        Accept structured numeric input-output examples and recover
+                    symbolic expressions composed from primitives and previously
+                    registered functions
+
+  Functional        Guide search using a TRM that fits in CPU memory and runs
+                    without GPU acceleration
+
+  Functional        Validate candidate expressions through exact execution with
+                    numerical tolerance (rel_tol=1e-6, abs_tol=1e-9) and a
+                    holdout split of one-third of the available examples
+
+  Functional        Fit a single multiplicative or additive constant when exact
+                    match fails but R2 exceeds 0.999
+
+  Functional        Simplify accepted compositions by pruning redundant steps
+                    and stripping unused input columns before registration
+
+  Functional        Store accepted functions in a persistent SQLite database with
+                    auto-computed layer assignment and JSON composition
+                    serialization
+
+  Functional        Expand TRM output heads when vocabulary grows, copying
+                    existing weights and initializing new rows near the empirical
+                    mean of established ones
+
+  Functional        Replay all known tasks after each new registration in
+                    curriculum order to mitigate catastrophic forgetting
+
+  Non-Functional    Operate on CPU-only hardware with 512 MB minimum RAM,
+                    1 to 2 GB recommended
+
+  Non-Functional    Produce symbolic outputs that a technical user can read and
+                    apply without additional tooling or library dependencies
+
+  Non-Functional    Persist registry and model checkpoint across restarts with
+                    vocabulary-size-aware checkpoint loading
+
+  Non-Functional    Expose all capabilities through a REST API with server-sent
+                    event streaming for live training logs
+
+
+Functional requirements describe what the system does; non-functional requirements
+describe the constraints under which it does so. The most consequential non-functional
+constraint is the CPU-only operating assumption. Every architectural decision — the
+two-layer TRM, the recursive rather than deep structure, the embedded SQLite registry,
+the single-file checkpoint format — was made with this constraint active throughout
+design.
+
+The numerical tolerance values deserve brief explanation. A relative tolerance of 1e-6
+accommodates the accumulation of floating-point rounding error across multiple
+composition steps. An absolute tolerance of 1e-9 handles cases where the expected
+output is very close to zero, where relative tolerance alone would be meaninglessly
+strict. Together these thresholds accept genuinely correct symbolic forms while rejecting
+candidates that are merely correlated with the target.
+
+3.2 Feasibility Study
+
+The project is technically feasible because each component relies on established and
+readily available libraries. PyTorch supports CPU inference and training without GPU.
+SQLite requires no external server. FastAPI runs on any Python environment. SvelteKit
+compiles to static assets that a simple HTTP server can serve. No component requires
+cloud services or specialized hardware.
+
+3.2.1 Technical Feasibility
+
+The TRM uses two transformer blocks with d_model=128 and eight attention heads.
+At this scale, a full forward pass with batch size 8 completes in tens of milliseconds on
+a modern CPU. Training on a single task with 30 epochs and 16 deep supervision steps
+per epoch completes in seconds. Full replay training across a registry of dozens of known
+tasks takes a few minutes. These timings are within the patience budget of an interactive
+engineering tool.
+
+The SQLite database serializes composition graphs as JSON strings. A registry with
+hundreds of functions occupies a few megabytes on disk. Checkpoint files holding the
+model state dictionary, optimizer state, and vocabulary size occupy tens of megabytes.
+Neither presents a storage challenge for any hardware capable of running Python.
+
+The attention matrices allocated during a TRM forward pass have shape
+(batch * n_heads, seq_len, seq_len) = (64, 8, 8), which is 4096 floats per pass.
+Across six refinement steps with T=3 deep recursion cycles, the peak attention allocation
+during the gradient pass stays well under one megabyte. This keeps the TRM practical
+for devices with 512 MB of RAM once operating system and Python runtime overhead
+is accounted for.
+
+The constant fitting procedure uses closed-form least-squares computation, requiring
+a single pass over the examples with no iterative optimization. The simplification
+procedures — step pruning and column stripping — require rerunning the executor on
+all examples for each tested variant, which is linear in the number of examples and
+composition length. Neither procedure adds meaningful latency to the registration
+pipeline.
+
+3.2.2 Economic Feasibility
+
+A local software system avoids the recurring cost of cloud inference APIs. The hardware
+requirement — a capable single-board computer — is a one-time cost measured in tens
+of dollars. The software stack is entirely open-source with no licensing fees. Deployment
+requires no subscription, no ongoing infrastructure management, and no network
+connectivity beyond the local device.
+
+In settings where data transfer costs money, such as cellular-connected field devices,
+keeping all computation local eliminates those costs entirely. In regulated environments
+where data egress requires compliance overhead, local processing simplifies that overhead
+substantially. A registry built over many discovery sessions retains its value across
+hardware refreshes, because the SQLite database can be copied to a replacement device
+with no loss of accumulated symbolic knowledge.
+
+3.2.3 Social Feasibility
+
+Symbolic outputs improve the likelihood of operator trust. An equation that can be
+printed on a calibration sheet, verified by a domain expert, and incorporated into a
+maintenance manual has social properties that a neural model's weights do not. Operators
+skeptical of machine learning in principle are often receptive to systems that produce
+auditable symbolic forms, because the output can be evaluated on its own terms by
+someone with no knowledge of how it was generated.
+
+The system also has pedagogical value. Watching a symbolic discovery system recover
+a kinetic energy equation from mass and velocity examples makes the concept of symbolic
+regression concrete in a way that statistical descriptions rarely achieve. In an academic
+setting, the system provides a working demonstration of how neural guidance, exact
+verification, and continual learning can be combined in a single coherent architecture.
+
+3.3 System Specification
+
+3.3.1 Hardware Specification
+
+The target hardware is a CPU-only single-board computer or equivalent low-power
+device. The minimum memory requirement is approximately 512 MB to hold the model,
+optimizer state, and an active training batch. In practice, 1 to 2 GB is recommended
+to accommodate the registry, replay buffer, and operating system overhead comfortably.
+
+Storage requirements are modest: a few hundred megabytes for the Python environment
+and library dependencies, plus a few megabytes for the database and checkpoint files.
+No GPU is required. No persistent network connection is required for the core discovery
+pipeline. A network connection is needed only if the user accesses the frontend from a
+separate device on the same local network.
+
+3.3.2 Software Specification
+
+The backend runs on Python 3.12 with PyTorch for the TRM, SQLite via the standard
+library sqlite3 module for persistence, and FastAPI with Uvicorn for the REST API
+server. NumPy handles constant fitting arithmetic and R2 computation. The frontend
+is built with SvelteKit and communicates with the backend over HTTP, using server-
+sent events for streaming training logs to the browser in real time.
+
+The composition execution layer is pure Python with no external symbolic math
+libraries. This keeps the runtime dependency surface minimal and avoids version
+compatibility concerns for long-lived deployments on devices that may not receive
+frequent software updates. Every composition step is a Python function call; no
+compilation or just-in-time lowering is involved.
+
+3.3.3 Operating Assumptions
+
+The system assumes that input data is organized as a table of numeric examples where
+each row is an input vector paired with a scalar output. Users are expected to supply
+meaningful examples rather than random noise, but the system tolerates irrelevant input
+columns automatically through the NULL-based column elimination mechanism described
+in section 4.2.5.
+
+The number of examples per task is expected to be small to medium — tens to hundreds
+of rows — consistent with the kinds of structured measurements generated in laboratory
+or instrument contexts. Very small example sets (fewer than five rows) reduce the
+effectiveness of the holdout split and increase the risk of accepting spurious relationships.
+
+The system assumes that discovered symbolic relationships can be expressed through
+compositions of the eighteen built-in primitives and any previously registered functions.
+Transcendental functions such as sin, exp, and log, implicit equations, and differential
+relationships are outside the current scope of the primitive vocabulary.

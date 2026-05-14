@@ -1,0 +1,235 @@
+                         7. RESULTS AND DISCUSSION
+
+                        Table 5. Validation and Output Summary
+
+  Observation Area           Representative Outcome          Interpretation
+
+  Primitive tasks with       SQUARE and FORCE recovered      NULL-based column
+  junk columns               despite random noise columns    elimination confirmed
+
+  Physics tasks with         KE recovered with k=0.5,        Constant fitting to
+  constants                  PE with k=9.81, both R2>0.999   R2>0.999 confirmed
+
+  Multicollinearity          KE and PE recovered despite     Holdout split correctly
+  condition                  correlated noise columns        rejected spurious fits
+
+  Synthesis task             TOTAL_E recovered as a          Vocabulary growth makes
+  (TOTAL_E)                  composition of KE and PE        complex tasks tractable
+
+  Retention after            Earlier primitives still        Full replay prevents
+  multiple registrations     discoverable throughout         catastrophic forgetting
+
+  Restart continuity         Registry and model reload       Persistence confirmed
+                             cleanly across sessions         across power cycles
+
+
+7.1 Validation and Output Review
+
+The noise column experiment proceeded through three parts, each building on the
+discoveries of the previous one. The structure was intentional: Part 1 established
+primitive vocabulary under junk columns, Part 2 extended that to physics relationships
+under correlated noise, and Part 3 synthesized those discoveries into a multi-step
+composition. The progressive dependency between parts means that a failure in any
+earlier part would cascade into the later ones, making the experiment a rigorous end-
+to-end test of the entire pipeline rather than a collection of independent checks.
+
+Part 1 established SQUARE and FORCE in the registry. SQUARE was presented with
+three input columns where two were purely random noise. The search correctly identified
+that only one column contributed to the output and recovered MUL(x, x) through single-
+column routing into both argument slots. FORCE was presented with four columns in
+interleaved order — junk, mass, junk, acceleration — and the search recovered
+MUL(mass, acceleration) by eliminating both noise columns through NULL routing.
+Both functions were registered at layer 1 with the correct arity and no fitted constants.
+
+Part 2 established KE and PE. KE was presented alongside a column containing
+mass plus a random perturbation in [-3, 3], creating a multicollinearity condition.
+Several candidate compositions passed the training split but failed the holdout split
+because they incorporated the correlated column, whose imperfect correlation was
+insufficient to generalize. The search eventually found the correct form — MUL applied
+to mass and SQUARE applied to velocity — and the constant fitting stage recovered
+k=0.5 with R2 above 0.999. PE was recovered similarly with k=9.81, the gravitational
+constant, fitting to within five decimal places of the true value.
+
+Part 3 presented TOTAL_E with junk columns interspersed among mass, velocity, and
+height. With KE and PE already registered, the search found the correct composition
+at depth 2: ADD(KE(mass, velocity), PE(mass, height)) with appropriate column
+routing to direct each subfunction to its relevant inputs. The registered function achieved
+R2 above 0.999 against the full example set including holdout.
+
+7.1.1 Representative Output Interpretation
+
+A successfully registered function is stored in the database as a JSON composition
+graph and rendered in the frontend as a human-readable symbolic expression. KE, for
+example, is stored as a two-step composition: first SQUARE applied to the velocity
+column, then MUL applied to mass and the result of the squaring step. A multiplicative
+constant of 0.5 is stored alongside the composition and applied after all steps evaluate.
+The frontend renders this as MUL(SQUARE(v), m) * 0.5, which a physicist or engineer
+can verify against the known formula immediately without any knowledge of how the
+system works internally.
+
+TOTAL_E is stored as a two-step parallel composition: KE applied to the mass and
+velocity routing, PE applied to the mass and height routing, ADD combining both
+results. The human-readable form makes explicit which input columns feed into which
+registered subfunction and confirms that none of the noise columns appear anywhere
+in the composition graph. The absence of noise columns is not something the system
+was told to achieve — it emerged from the validation criterion rejecting candidates that
+incorporated them.
+
+The R2 score displayed alongside each registered function provides a quantitative
+summary of how well the discovered expression accounts for the variance in the training
+examples. All functions registered during the noise experiment achieved R2 above 0.999
+against the full example set, confirming that the discovered expressions generalize and
+are not artifacts of the training split selection.
+
+7.1.2 Graphs and Inferences
+
+The streaming training log produced during each search session provides a step-by-step
+record of the TRM's reasoning. In the early steps of a search, the TRM's top-5
+predictions tend to be distributed broadly across the vocabulary, reflecting the high
+temperature at the start of search and the zero-initialized carry state. As the carry warms
+across steps, the distribution sharpens and the correct primary and secondary functions
+move toward the top of the ranked list.
+
+For the KE task, the TRM consistently proposed MUL as the primary function and
+SQUARE as the secondary function by step 3 or 4 of search, before the correct
+composition was validated. The composition type head showed increasing probability
+on the nested type — consistent with the structure ADD(SQUARE(v), ...) — across the
+same steps. This convergence pattern confirms that the carry state is integrating useful
+information from the encoded examples across steps rather than producing independent
+predictions at each step.
+
+Near-miss logging during the multicollinearity condition revealed candidates that used
+the correlated noise column. These candidates achieved R2 values in the range of 0.97
+to 0.99 against the training split, which is high enough that a purely confidence-based
+acceptance criterion would have accepted them. The executor-based holdout validation
+rejected all of them, and the logged R2 values against the holdout split for these
+candidates were consistently lower — in the range of 0.90 to 0.96 — confirming that
+the generalization gap was detectable and that the holdout split was doing the work
+it was designed to do.
+
+For tasks where the TRM had been trained through many replay passes on similar
+functions, the halt head triggered early exit at supervision step 4 or 5 rather than
+completing all 16 steps. The total training time for these tasks was proportionally
+reduced. This behavior is a form of learned curriculum efficiency that emerges from
+the training dynamics: the model becomes faster at familiar problem types as it
+accumulates experience through replay.
+
+7.2 Discussion
+
+The most significant finding from the noise experiment is the TOTAL_E synthesis result.
+Discovering TOTAL_E from raw examples without KE and PE in the registry would
+require finding, in a single search pass, a five-step composition from primitives
+involving three input columns, a multiplicative constant, a squaring operation, an
+intermediate multiplication, and a final summation. At the default search depth and step
+budget, this is not tractable. With KE and PE already registered, the same relationship
+is a two-step depth-2 composition. The registry reduced what would have been an
+unreachable target into a straightforward search.
+
+This confirms the central architectural claim: accumulated discoveries make harder
+problems qualitatively reachable, not merely faster to solve. A system with a fixed
+primitive vocabulary and no growing registry cannot exhibit this behavior regardless
+of how its search budget is scaled, because the required subexpressions simply do not
+exist as named, callable entities in its search space.
+
+The multicollinearity result confirms the value of the holdout split as a verification
+component rather than a convenience. Removing the holdout and accepting candidates
+on training-split accuracy alone would have produced incorrect registrations in Part 2
+of the experiment. The registered functions would have incorporated the correlated
+noise column, their R2 on fresh data would have been lower than the acceptance
+threshold, and Part 3 would have built TOTAL_E on top of these incorrect foundations
+— producing a cascading error that the experiment structure was specifically designed
+to expose.
+
+One aspect of the deep supervision training that was not anticipated at design time is
+how quickly the carry state converges for tasks the TRM has encountered many times
+through replay. For primitive tasks presented after ten or more replay passes, the halt
+head triggered early exit consistently by step 4 or 5. The total supervision steps
+consumed per replay epoch for these tasks dropped to roughly one-third of the default
+16. This means the cost of replay training does not scale linearly with the number of
+replay passes as the registry grows — frequently replayed tasks become cheaper per
+epoch, partially offsetting the cost of maintaining a larger replay buffer.
+
+The head initialization strategy near the existing mean produced a measurable
+improvement in how quickly newly registered functions appeared in TRM predictions
+after expansion. With random initialization, newly registered functions rarely appeared
+in top-5 predictions until after two or three full replay passes. With mean-centered
+initialization, they appeared in top-5 predictions in the first replay pass in all tested
+cases. This matters for the synthesis task: if KE and PE were not reliably proposed by
+the TRM immediately after registration, the TOTAL_E search would not benefit from
+them appearing in the depth-3 candidate set.
+
+7.3 Limitations and Risk Observations
+
+The system is sensitive to the quality and coverage of the provided examples. Too few
+examples increase the risk that a spurious relationship passes the holdout split simply
+because the holdout is too small to expose the generalization gap. The minimum
+practical example count is around ten, with at least four in the holdout. Examples with
+narrow value ranges may prevent discovery of relationships that only manifest clearly
+at the boundaries of the input domain.
+
+The search depth is bounded by max_depth=3 and the step budget by max_steps=10
+by default. Relationships that require four or more composition steps from primitives,
+or that require composing three or more previously registered functions in novel
+arrangements, may not be discoverable within these limits. Increasing max_steps
+extends discovery time roughly linearly; increasing max_depth expands the candidate
+set at depth 3 and can increase per-step search time if the vocabulary is large.
+
+The constant fitting mechanism supports only a single multiplicative or additive constant
+per function. Relationships requiring multiple independent constants — such as a linear
+model y = a*x + b where both a and b must be fitted — cannot be expressed in the
+current framework. The additive constant fit requires the offset to be truly constant
+across all examples, which means even slightly non-constant offsets will be rejected.
+This is a deliberate conservatism rather than an oversight: accepting noisy offsets would
+reduce confidence in the registry's correctness guarantees.
+
+The primitive vocabulary does not include transcendental functions. Relationships
+involving sin, cos, exp, or log are not discoverable from the current primitive set.
+Extending the vocabulary to include these would expand the scope of discoverable
+relationships but would also expand the search space, potentially requiring a larger step
+budget for problems that do not involve transcendental functions.
+
+7.4 Practical Implications
+
+For laboratory instrumentation, the system provides a path from raw sensor measurements
+to a verified symbolic calibration equation. The equation is expressed in terms of the
+input variables and is auditable by the calibration engineer without any machine learning
+expertise. The discovered expression can be copied directly into firmware, embedded
+in a calibration certificate, or incorporated into a data processing script, all without
+any dependency on the system that produced it.
+
+For embedded monitoring systems, the growing registry provides a mechanism for
+incremental knowledge accumulation that does not require sending data to a cloud
+service. As the device encounters new phenomena over its operational lifetime, it can
+discover and store new symbolic relationships locally. Earlier discoveries remain
+accessible as building blocks, so the system's ability to handle increasingly complex
+phenomena grows with its operational history.
+
+For research applications, the system provides a lightweight interpretable alternative to
+large neural regression models for hypothesis generation from small datasets. A
+researcher who suspects a power-law or product relationship between measured quantities
+can submit a dataset of examples and receive a verified symbolic form within seconds.
+The expression can then be tested against additional data, incorporated into a theoretical
+model, or used as the basis for a follow-up experiment — all without treating the
+discovery process itself as a black box.
+
+7.5 Cost Analysis
+
+A local deployment on a single-board computer capable of running Python 3.12 costs
+in the range of 50 to 100 US dollars in hardware. No cloud subscription, API key, or
+ongoing data transfer cost is involved. The software stack is entirely open-source.
+Maintenance consists of periodic checkpoint and database backups, which can be
+automated with a standard scheduled task.
+
+For environments where data egress incurs compliance costs, local processing eliminates
+those costs entirely. For environments where connectivity is intermittent, local processing
+ensures that discovery sessions complete without network access. The SQLite database
+can be copied to a replacement device in seconds, carrying the full accumulated registry
+with no loss of symbolic knowledge.
+
+The economic case strengthens as the registry grows. A registry built over a year of
+calibration work contains symbolic building blocks that shorten future calibration
+sessions. Each additional discovery reduces the effective cost of the next one, because
+the growing vocabulary makes harder targets reachable within the same step budget
+that could only reach simpler targets when the registry was smaller. This compounding
+return on accumulated knowledge is the economic argument for the registry-based
+architecture rather than a stateless symbolic solver.

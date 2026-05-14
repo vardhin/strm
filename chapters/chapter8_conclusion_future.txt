@@ -1,0 +1,132 @@
+                   8. CONCLUSION AND FUTURE ENHANCEMENTS
+
+8.1 Conclusion
+
+NSSR demonstrated that neural-guided symbolic regression can be made practical on
+CPU-only edge hardware without sacrificing the interpretability that motivates the
+approach. The key architectural choices — a recursive rather than deep transformer
+structure, exact execution-based validation, a growing SQLite-backed vocabulary
+registry, and full replay-based continual learning — each addressed a specific gap in
+the prior art and worked together coherently in the final system.
+
+The Tiny Recursive Model, adapted from Jolicoeur-Martineau's (2025) "Less is More"
+framework, proved to be the right neural backbone for this setting. Achieving 42
+effective transformer layers from two actual parameter layers kept the model within the
+memory budget of a single-board computer while providing enough reasoning depth to
+guide search toward correct symbolic compositions. The separation of the latent reasoning
+state z from the answer state y, and the y-only final update step that deliberately excludes
+the input, produced a model that generates progressively improving predictions across
+successive forward passes — behavior that is essential for iterative search guidance and
+that a standard single-pass transformer does not naturally exhibit.
+
+The deep supervision training regime reinforced this behavior during training. By
+accumulating loss across all 16 supervision steps per epoch rather than only at the final
+step, the training objective directly penalized carries that produce poor predictions
+mid-sequence. The result was a model whose predictions improve monotonically across
+steps on familiar tasks, and whose halt head correctly signals convergence for well-
+practiced tasks after as few as four or five steps, reducing the cost of replay training
+for those tasks over time.
+
+The noise column experiment confirmed the three most important design claims. The
+NULL-based column elimination correctly identified and excluded irrelevant inputs in
+all tested configurations, including the multicollinearity condition where a correlated
+noise column provided a partial signal strong enough to fool a training-split-only
+acceptance criterion. The holdout split caught every spurious candidate in Part 2 of the
+experiment, confirming that the two-split acceptance criterion provides meaningful
+generalization protection beyond what training accuracy alone can offer. The constant
+fitting mechanism recovered k=0.5 for kinetic energy and k=9.81 for potential energy,
+both to within five decimal places of their true values, with R2 exceeding 0.999 in
+every accepted case.
+
+The synthesis result in Part 3 of the experiment — recovering TOTAL_E as a two-step
+composition of the previously discovered KE and PE functions — provided the clearest
+demonstration of what the growing registry contributes. Without KE and PE in the
+registry, TOTAL_E is a five-step composition from primitives that exceeds the default
+search depth. With them, it is a depth-2 composition that the search finds in a handful
+of steps. The registry did not merely speed up the discovery; it made the discovery
+tractable at all within the given resource budget. This distinction is the core argument
+for vocabulary growth as an architectural property rather than an optional optimization.
+
+Full replay after each registration prevented catastrophic forgetting across all tested
+retention cases. Earlier tasks remained discoverable throughout the experiment, even
+after the vocabulary had grown through multiple rounds of head expansion and the model
+had undergone many replay passes on newer, more complex tasks. The head initialization
+strategy — new rows near the empirical mean of existing rows — ensured that newly
+registered functions appeared in the TRM's top-5 predictions from the first replay pass
+after expansion, which was necessary for them to contribute to depth-3 candidate
+generation immediately after registration.
+
+The registry is the most durable artifact the system produces. Model weights are a means
+to an end — a tool for guiding search toward correct compositions — and they can be
+retrained from scratch given the replay buffer. The registry, by contrast, accumulates
+verified symbolic knowledge that is independent of the model. An equation stored in the
+registry today remains correct and callable tomorrow regardless of what happens to the
+model. This asymmetry between the transient nature of the neural component and the
+durable nature of the symbolic registry is, in a sense, the point of the entire architecture.
+
+8.2 Future Enhancements
+
+Several directions for extending the system merit serious consideration.
+
+The constant fitting mechanism currently supports only a single multiplicative or additive
+scalar per function. Extending it to fit multiple constants jointly — for example,
+recovering y = a*x^2 + b*x from examples where both a and b are unknown — would
+expand the class of discoverable relationships substantially. This would require a more
+careful acceptance criterion to prevent overfitting to small example sets, likely involving
+a penalty term on the number of fitted constants relative to the number of examples.
+
+The simplification module applies three strategies: single-function match, step pruning,
+and column stripping. Adding algebraic identity simplification — recognizing that
+MUL(x, CONST(1)) reduces to CONST(x), or that ADD(x, NULL(y)) reduces to x —
+would produce cleaner registered expressions and prevent the accumulation of
+compositionally valid but symbolically redundant functions in the registry over long
+sessions.
+
+Adaptive replay scheduling is a natural extension of the current full-replay approach.
+Rather than giving every task equal weight in every replay pass, a policy that prioritizes
+tasks where the TRM's current predictions are furthest from correct would direct training
+effort where it is most needed. This could reduce total replay training time without
+compromising retention, particularly as the registry grows to hundreds of functions and
+full-buffer replay becomes the dominant cost per registration.
+
+Cross-device registry sharing would extend the system's utility to multi-instrument
+environments. A compact symbolic exchange format — essentially a serialization of the
+composition graphs and fitted constants for a subset of the registry — would allow two
+devices to share discovered functions without transferring any raw measurement data.
+Each device could discover functions locally and share only the verified symbolic results,
+enabling distributed knowledge accumulation while fully preserving data locality.
+
+Typed function signatures, where each function declares the expected type of each input
+and the type of its output, would allow the search to prune structurally invalid
+compositions before executing them. For example, a function that produces a Boolean
+output (0 or 1) should not feed into the primary argument of MUL in a context where
+a continuous value is expected. Type checking at candidate generation time would reduce
+the number of candidates that consume executor time only to fail at execution, improving
+search efficiency as the vocabulary grows.
+
+Human-in-the-loop acceptance provides a path toward higher-stakes deployments. Rather
+than accepting a candidate automatically when it passes the validation criterion, the
+system could present verified candidates to an operator for confirmation before
+registration. The operator's confirmation adds a layer of domain-specific sanity checking
+that the symbolic executor cannot provide: for example, catching a relationship that is
+mathematically correct on the provided examples but physically implausible given the
+known properties of the measured system. This is particularly relevant in safety-critical
+instrument calibration contexts where an incorrect registry entry could propagate errors
+through many downstream computations.
+
+The primitive vocabulary is the most consequential boundary on what the system can
+discover. Adding transcendental primitives — sin, cos, exp, log — would expand the
+scope of discoverable relationships to include oscillatory, exponential, and logarithmic
+phenomena. The main engineering challenge is that these primitives can produce complex
+floating-point behavior (infinities, NaN values, extreme sensitivities near singularities)
+that the executor would need to handle gracefully. The acceptance criterion would also
+need adjustment, since exact-match validation at rel_tol=1e-6 may be too strict for
+expressions involving transcendental functions evaluated at large or small arguments.
+
+Finally, the search depth and step budget are currently fixed parameters. An adaptive
+search policy that increases depth and step count on each retry, guided by the best near-
+miss R2 observed so far, would allocate search resources more efficiently than the
+current fixed retry with temperature boost. A search that has seen near-misses with
+R2 of 0.99 is close to a solution and deserves more steps; a search that has seen near-
+misses with R2 of 0.5 is far from a solution and might benefit more from a different
+starting carry than from additional steps at the same depth.

@@ -1,5 +1,5 @@
 """
-Composition simplifier for NSSR.
+Composition simplifier for NSRR.
 
 After search finds a working composition, try to make it shorter
 before registering it as a new function.

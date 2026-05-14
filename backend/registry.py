@@ -1,5 +1,5 @@
 """
-Function registry for NSSR.
+Function registry for NSRR.
 
 Manages primitives and learned (composed) functions.
 State is a plain dict passed to every function — no globals, no classes.

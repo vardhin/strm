@@ -1,0 +1,269 @@
+                         6. PROJECT IMPLEMENTATION
+
+6.1 Experimental Setup
+
+The implementation runs as a locally deployed service. The FastAPI backend handles
+all discovery logic, communicating with the SQLite database and the TRM checkpoint
+stored in a local checkpoints directory. The SvelteKit frontend, compiled to static
+assets, is served from the same machine or from any machine on the local network with
+HTTP access to the server port.
+
+Development and all reported testing were conducted on a standard desktop workstation
+running Python 3.12. The system was designed to run identically on a single-board
+computer; the only expected difference is wall-clock time for training and search, both
+of which scale with hardware speed and can be bounded by adjusting max_steps and
+num_epochs without changing any other part of the pipeline.
+
+6.1.1 Project Structure
+
+The backend is organized into ten Python modules with no circular imports. Each module
+has a single responsibility and exposes only the functions that other modules need to
+call.
+
+schema.py defines the SQL CREATE TABLE and CREATE INDEX statements for the
+functions table as module-level string constants. db.py implements all SQLite operations,
+taking a sqlite3.Connection as its first argument on every function so that connection
+management stays in the caller rather than being hidden inside the module. registry.py
+manages the in-memory function state as a plain Python dictionary, with no module-
+level globals. model.py implements the TRM, the Carry dataclass, and the head expansion
+utility. train.py implements the deep supervision loop and the replay training loop.
+search.py implements TRM-guided candidate generation and the full search entry point.
+executor.py implements composition execution and candidate validation. simplify.py
+implements the three simplification strategies. main.py is the standalone command-line
+orchestrator. server.py is the FastAPI HTTP server that exposes all backend capabilities
+through a REST API.
+
+A separate experiment file, experiment_noise.py, communicates with the running server
+over HTTP to execute the three-part noise column experiment as an end-to-end
+integration test.
+
+The frontend is a standard SvelteKit project. Pages cover training, function browsing,
+dataset management, graph visualization, and composition prediction. An api.js module
+centralizes all HTTP communication with the backend, including server-sent event
+parsing for streaming training logs.
+
+6.1.2 Local Storage Layout
+
+All persistent state lives in the checkpoints directory, which is created automatically
+on first run. The symbolic.db file holds the complete function registry — primitives and
+all learned functions — as a SQLite database. The model.pt file holds the TRM weight
+state dictionary, optimizer state dictionary, and vocabulary size, written by PyTorch's
+torch.save and read by torch.load.
+
+Both files are small enough to be backed up on any removable storage medium. The
+database grows by one row per registered function, with the composition column holding
+a JSON string that is typically under a few hundred bytes per function. The model
+checkpoint is dominated by the optimizer's Adam moment buffers, which scale with
+parameter count rather than vocabulary size.
+
+Log output from the server captures a complete record of each training session: the
+encoded input shape, the TRM's top-5 predictions at each search step with their
+probabilities, descriptions of near-miss candidates with R2 scores, the accepted
+composition before and after simplification, and the final R2 of the registered function
+against its training examples.
+
+6.1.3 Execution Sequence
+
+A typical session begins with the user uploading a dataset through the frontend or by
+posting directly to the /datasets endpoint. The dataset is stored in the SQLite database
+as a named collection of (input_vector, output_scalar) pairs alongside the function
+registry.
+
+The user initiates training by specifying the target function name, the dataset to use,
+and optional parameters: max_depth, num_epochs, max_search_steps. The server's
+training endpoint calls the learn function from main.py. The learn function initializes
+the replay buffer if this is the first call, searches for a candidate, simplifies the best
+match, registers it, expands the model heads if the vocabulary has grown, rebuilds the
+optimizer, and runs full replay training. Log lines are streamed to the frontend via
+server-sent events throughout this process.
+
+After training completes, the registered function appears in the function browser, where
+the user can inspect its composition graph, execute it on new inputs directly from the
+browser, view its layer assignment and arity, and see its R2 score against the training
+examples.
+
+6.2 Datasets with Descriptions
+
+Four categories of datasets were used to validate the system, organized by the kind of
+symbolic challenge each presents. They are described here in the order in which they
+were used during the noise experiment, which also reflects the intended order of
+progressive difficulty.
+
+6.2.1 Primitive Dataset Orientation
+
+Primitive datasets contain examples of single-function relationships drawn directly from
+the built-in primitive set. Each dataset contains ten to twenty examples with inputs drawn
+from a fixed numeric range. Targets include addition, multiplication, squaring, increment,
+and bitwise operations. These datasets establish the foundational vocabulary entries
+that later compositional tasks depend on.
+
+Noisy variants of these datasets insert one or two random-valued columns alongside
+the meaningful inputs. SQUARE(x), for example, was presented with two additional
+junk columns containing random values drawn uniformly from [-100, 100]. The search
+must discover that those columns do not contribute to the output and route only x into
+both argument slots of MUL. Successfully recovering SQUARE under these conditions
+confirms that NULL-based column elimination is working correctly at the most basic
+level.
+
+6.2.2 Compositional Dataset Orientation
+
+Compositional datasets contain examples of relationships that require at least two
+composed functions to express. Sequential compositions test whether the search can
+chain two functions, for example INC(MUL(a, b)). Nested compositions test whether
+the search can apply the same function to multiple inputs before combining results,
+for example ADD(SQUARE(a), SQUARE(b)). Parallel compositions test routing of
+three input columns through three distinct operations before combining.
+
+Strong performance on compositional datasets confirms that the registry is providing
+real search value. The system is reusing previously discovered functions rather than
+re-deriving every subexpression from primitives, which is only possible when those
+functions are correctly stored and correctly reconstructed from the database.
+
+6.2.3 Physics-Inspired Dataset Orientation
+
+Physics-inspired datasets present relationships drawn from classical mechanics. Three
+tasks were used: kinetic energy (KE = 0.5 * m * v^2), potential energy
+(PE = m * 9.81 * h), and total mechanical energy (TOTAL_E = KE + PE).
+
+These were chosen because they are compositional in the right way. TOTAL_E requires
+composing the KE and PE functions, which in turn require squaring and multiplication.
+The multi-step dependency means TOTAL_E is only reachable within a reasonable search
+budget if KE and PE are already in the registry. If they are not, the search must find a
+five-step composition from primitives in a single pass, which exceeds the default depth
+and step budget.
+
+The physics tasks also require constant fitting. The factor of 0.5 in KE and the
+gravitational constant 9.81 in PE cannot be expressed through the primitive vocabulary
+without constant fitting. These tasks validate that the multiplicative constant fit with
+R2 threshold 0.999 correctly recovers physically meaningful scaled relationships and
+that the recovered coefficient matches the true value to within the floating-point
+precision of the least-squares computation.
+
+6.2.4 Noise-Aware Dataset Orientation
+
+Noise-aware datasets extend the physics-inspired tasks with irrelevant input columns.
+Three levels of noise were used across the experiment parts.
+
+The first level adds columns containing purely random values drawn from [-100, 100]
+with no correlation to the output. SQUARE(x) was presented with two such columns,
+and FORCE(m, a) = MUL(m, a) was presented with interleaved junk columns on both
+sides of the meaningful inputs.
+
+The second level adds columns that are correlated with a meaningful input. KE was
+presented with a column containing m + random(-3, 3), a value loosely correlated
+with mass. This creates a multicollinearity condition where the noise column provides
+a partial signal that could mislead the search into accepting a spurious relationship.
+The holdout split provides the primary defense here: a candidate that uses the correlated
+column will fit the training examples imperfectly and fail on enough holdout examples
+to be rejected.
+
+The third level combines noise tolerance with multi-step synthesis. TOTAL_E was
+presented with junk columns interspersed among its three meaningful inputs (mass,
+velocity, height), requiring the search to simultaneously compose KE and PE from the
+registry and ignore the irrelevant columns. This is the most challenging condition and
+is only tractable because the registry already contains KE and PE from the earlier
+parts of the experiment.
+
+6.3 Module-Level Implementation Notes
+
+Several implementation details are worth recording for the benefit of future development
+or porting work.
+
+The encoding function applies element-wise operations to a list of example inputs and
+produces no large intermediate tensors. Its peak memory usage is proportional to
+batch_size * seq_len * input_dim = 8 * 8 * 32 = 2048 floats per call, which is
+negligible.
+
+The TRM's recursion layer norm is applied to the sum x+y+z before each transformer
+block application. This normalization was added after NaN loss values were observed
+during early training on tasks with input values in the thousands. Without it, repeated
+addition across n=6 refinement steps produces tensor norms that grow quadratically,
+saturating the softmax in the attention mechanism within a few steps. The layer norm
+keeps the input distribution stable regardless of how many refinement steps have
+accumulated in the carry.
+
+The LOOP, WHILE, and ACCUM primitives enforce a hard limit of 1000 iterations per
+call. This limit is checked at the start of each iteration, so the primitive always returns
+within a bounded number of Python operations regardless of the body function's behavior
+or the input values. The limit was set at 1000 because it is large enough to express any
+relationship in the tested datasets — the largest iteration count encountered in a
+registered function was in the low tens — while being small enough that a runaway
+LOOP call adds at most a few milliseconds of latency before returning.
+
+The available_values list in the executor starts with the raw input values and gains one
+entry per composition step. For typical compositions of two to five steps, this list stays
+under ten elements. There is no recursive call structure for non-LOOP compositions;
+execution is purely sequential Python iteration over the composition steps, which means
+there is no risk of Python recursion depth errors regardless of how many layers deep
+a registered function's composition tree extends.
+
+The server-sent event streaming in server.py uses a generator function that yields
+log lines as they are produced by the learn function. This allows the frontend to display
+search progress in real time without the training call blocking the entire HTTP response.
+The generator catches exceptions from the learn function and yields them as error events
+before closing the stream, so the frontend always receives a terminal event regardless
+of whether training succeeded or failed.
+
+6.4 Implementation Workflow Notes
+
+The implementation was built from the inside out: registry and executor first, then TRM
+and training, then search, then simplification, then the orchestrator, then the server and
+frontend. This order ensured that each layer was independently testable before the layer
+above it was built. Integration bugs could therefore be attributed to the newly added
+layer rather than requiring investigation across the entire stack.
+
+6.4.1 Operator Workflow
+
+From the operator's perspective, the interaction is straightforward. A dataset of examples
+is prepared as a list of input-output pairs and uploaded through the frontend's dataset
+upload interface or by posting JSON to the /datasets endpoint directly. A training request
+specifies the target function name, the dataset to use, and optional parameters.
+
+The system streams progress through the browser: which functions the TRM is predicting
+at each step, what compositions are being tried, whether the holdout validation passed,
+and whether simplification reduced the composition. The final result shows the discovered
+function's name, its human-readable composition, its layer in the registry, and its R2
+score.
+
+After registration, the function appears in the function browser immediately. The user
+can enter new input values directly in the browser and execute the function to verify
+its behavior on examples outside the training set. Functions from the registry can be
+selected as building blocks when constructing manual compositions through the frontend's
+equation editor.
+
+6.4.2 Practical Implementation Observations
+
+Several implementation decisions emerged as important during development that were
+not obvious at design time.
+
+The recursion layer norm was the most consequential addition. Early training runs on
+physics-inspired datasets with input values representing real physical quantities — masses
+in kilograms, velocities in meters per second — produced NaN loss within the first five
+epochs. Adding the layer norm before each block application in the recursion loop
+resolved the instability completely without requiring any change to the learning rate
+or gradient clipping configuration.
+
+Head initialization near the existing mean was the second non-obvious choice. Initial
+experiments used random normal initialization for new head rows, with the result that
+newly registered functions were almost never proposed by the TRM in the first several
+training epochs after head expansion. The logit values for new rows started far below
+the established range, systematically suppressing the new function in softmax
+normalization. Initializing new rows at the mean of existing rows with a small noise
+perturbation resolved this immediately: new functions appeared in the TRM's top-5
+predictions within the first replay pass after registration.
+
+The fixed holdout selection — chosen once per task and reused across all search steps —
+was also a deliberate choice made after observing unexpected behavior with dynamic
+holdout selection. When the holdout was resampled at each step, the search occasionally
+accepted candidates that matched six out of eight training examples and all three holdout
+examples in one particular resampling, only for the registered function to fail on roughly
+one-quarter of examples drawn from the same distribution. Fixing the holdout eliminated
+this failure mode by ensuring that the holdout provides a consistent generalization
+criterion across the entire search rather than a criterion that varies with the sampling
+seed at each step.
+
+The curriculum task generator uses a fixed seed of 777 for the random number generator
+that produces example inputs. This was chosen to ensure that the initial replay buffer
+is identical across all training sessions that start from an empty registry, which makes
+the system's behavior reproducible when starting fresh on a new device or after a
+registry reset.

@@ -1,0 +1,242 @@
+                        5. METHODOLOGY AND TESTING
+
+5.1 Methodology
+
+The development methodology followed a staged build order aligned with the data flow
+through the system. Each stage was independently testable before the stage above it was
+built, which kept debugging localized and prevented integration surprises from
+compounding across multiple untested layers.
+
+Stage one implemented and verified the TRM in isolation. The model was trained on
+small synthetic tasks — predict which of five functions was applied to a set of inputs —
+to confirm that the recursive training scheme produces stable gradients and that deep
+supervision causes predictions to improve across successive supervision steps rather than
+remaining flat. The carry state behavior, the y-only final update step, and the halt
+mechanism were each verified separately before integration.
+
+Stage two implemented the primitive function set, the registry, and the executor. Each
+primitive was confirmed against known input-output pairs. The executor was tested with
+hand-constructed composition graphs for all six composition types. The registry load-
+rebuild cycle was tested by saving to SQLite and reloading in a new Python process,
+confirming that composition closures rebuilt from database records produce identical
+outputs to those built during the original registration session.
+
+Stage three integrated the search loop, connecting TRM predictions to candidate
+generation and executor validation. Search was first tested on depth-1 single-function
+targets — recovering ADD, MUL, SQUARE — before being tested on depth-2
+compositions. Constant fitting was tested separately on examples constructed to have
+exact multiplicative relationships, confirming that the least-squares scale recovery
+produces the correct coefficient before the R2 threshold was tuned.
+
+Stage four added the simplification module and verified that all three strategies correctly
+reduced composition length or arity without changing the output of any validated
+composition. Step pruning was tested with compositions that had a redundant middle
+step. Column stripping was tested with compositions that referenced only a subset of
+their declared input columns.
+
+Stage five integrated the replay buffer and head expansion mechanism. The full learn
+cycle was tested end-to-end: search, simplify, register, expand heads, rebuild optimizer,
+replay. Retention tests confirmed that earlier tasks remained discoverable after several
+new functions were registered and the model had undergone multiple rounds of head
+expansion and replay training.
+
+Stage six built the FastAPI server, connected it to the backend modules, and built the
+SvelteKit frontend. The three-part noise column experiment was then run against the live
+server as an integration test of the complete pipeline under realistic conditions.
+
+5.2 Testing Strategy
+
+Five categories of testing were applied across the development stages. Together they
+cover correctness at the function level, consistency across the full pipeline, validity of
+the acceptance criterion, robustness of the forgetting prevention mechanism, and
+durability of persistent state.
+
+5.2.1 Unit Testing
+
+Unit tests targeted individual functions within each module. The encoding function was
+tested for output shape, value range, and sign correctness across positive, negative, and
+zero inputs. The executor was tested for all six composition types with known results,
+including the LOOP primitive in both its three-argument and four-argument forms. The
+registry was tested for correct layer computation — confirming that a function whose
+deepest child is at layer 2 receives layer 3 — and for correct JSON serialization and
+deserialization of composition graphs including the special -1 arg index.
+
+The simplifier was tested with compositions that had a known prunable step and with
+compositions that had known unused columns. The constant fitting functions were tested
+with examples constructed to have exact multiplicative relationships (confirming recovery
+of the coefficient to within floating-point precision) and with examples where the
+differences between produced and expected values were not constant (confirming that
+the additive fit correctly rejects non-constant offsets).
+
+5.2.2 Integration Testing
+
+Integration tests ran the full pipeline from examples to registration. The primary
+integration test submitted a small set of examples for a known two-step composition,
+verified that search found the correct candidate within the allotted steps, confirmed
+that the registered function produced the correct output when called through the
+rebuilt registry closure, and checked that the database record reflected the correct
+composition graph and layer assignment.
+
+Secondary integration tests covered head expansion specifically. After registering a
+new function, the TRM's output head dimensions were confirmed to match the new
+vocabulary size. The training loop was then run for one epoch to confirm that loss
+values remain finite and that no NaN or Inf values appear in the gradient, which would
+indicate that the head expansion or optimizer rebuild had introduced a numerical
+instability.
+
+A third integration test covered the server-sent event streaming endpoint. A training
+request was submitted through the HTTP API and the streamed log lines were parsed
+to confirm that TRM predictions, candidate descriptions, and final R2 scores all appeared
+in the expected format and at the expected points in the search sequence.
+
+5.2.3 Validation Testing
+
+Validation tests confirmed that the acceptance criterion correctly distinguishes valid from
+invalid candidates. Candidates with R2 of 0.995 and no viable constant fit were confirmed
+to be rejected. Candidates with R2 of 0.9995 under a multiplicative fit were confirmed
+to be accepted. The holdout split was tested by constructing examples where a candidate
+matched the training split exactly but failed on three of the holdout examples, confirming
+that such candidates are rejected even when training-split accuracy is perfect.
+
+The additive constant fit was tested with examples where the gap between produced and
+expected values was constant across all examples, confirming acceptance, and with
+examples where the gap varied by more than 1e-6 across examples, confirming rejection.
+This distinction matters because a varying gap indicates the expression is structurally
+wrong, not merely scaled incorrectly.
+
+5.2.4 Retention Testing
+
+Retention tests measured whether previously discovered functions remained recoverable
+after subsequent registrations. After registering five functions sequentially — each
+triggering a head expansion and a full replay training pass — the TRM was presented
+with the examples that had produced the first registered function. The search succeeded
+in recovering that function in all tested cases within the default step budget.
+
+A more targeted retention test ran search on the first registered function immediately
+after registering the fifth, without any intermediate replay. This confirmed that the
+full-replay training conducted after the fifth registration was sufficient to maintain
+earlier competence, rather than requiring a separate consolidation pass per earlier task.
+
+The halt head behavior was also monitored during retention tests. For tasks that the
+TRM had seen many times through replay, the halt head triggered early exit at supervision
+steps 4 or 5 rather than completing all 16 steps, indicating that the carry state converges
+faster for well-practiced tasks. This behavior is desirable: it means replay training for
+familiar tasks is cheaper per epoch than replay training for novel ones.
+
+5.2.5 Persistence Testing
+
+Persistence tests restarted the Python process after registering several functions and
+confirmed three properties: the registry loaded correctly from SQLite with all functions
+producing the same outputs as before the restart, the TRM loaded from checkpoint with
+the correct vocabulary size and produced the same top-k predictions on the same encoded
+input, and the replay buffer was correctly reinitializable from the database records so
+that a fresh training session could continue from where the previous one left off.
+
+The checkpoint resize-and-transfer path was tested explicitly by saving a checkpoint
+with a vocabulary of size N, registering two additional functions to reach size N+2, and
+then loading the checkpoint. The loader correctly created a temporary model at size N,
+loaded the saved weights, resized heads to N+2, and initialized the two new rows near
+the mean of the existing N rows. The transferred model produced the same predictions
+as the pre-save model on the N originally known functions.
+
+5.2.6 Performance Testing
+
+Performance testing measured wall-clock time for the operations most relevant to
+interactive use. Single-task search with max_steps=10 completed in under 5 seconds
+for depth-1 and depth-2 targets on a standard desktop CPU. Full replay training across
+a buffer of 20 tasks with two epochs per task and 16 supervision steps per epoch
+completed in under 3 minutes. The server's training endpoint, measured end-to-end
+from HTTP request to final streamed log line, stayed within the range expected for an
+interactive tool — fast enough that a user can submit a dataset, observe the search
+progress in real time through the streamed logs, and receive a result without leaving
+the browser tab.
+
+Candidate generation and validation were profiled separately to confirm that the 30-
+candidate cap on parallel routing combinations and the three-depth search structure do
+not produce pathological cases. The worst-case candidate count observed across all tested
+tasks was in the low hundreds per search step, all of which were evaluated by the executor
+within a fraction of a second.
+
+5.3 Validation Principles
+
+Acceptance rests entirely on execution against data. A candidate is accepted because
+the symbolic executor confirms it produces the correct output for every example in both
+the training and holdout splits. No neural confidence score, no heuristic reward, and no
+statistical proxy serves as the acceptance gate. This is the most important principle for
+the integrity of the registry: every registered function is one that has been verified to
+work, not one that a model believed was likely to work.
+
+The holdout split guards against the specific failure mode where a candidate fits the
+training examples but generalizes incorrectly. Because the holdout is selected once per
+task and held fixed across all search steps, a candidate that passes the holdout is
+genuinely matching the underlying relationship rather than exploiting a coincidence in
+the training portion of the example set. If the holdout were resampled at each step, a
+patient search could effectively overfit to the full example set through repeated exposure.
+
+Simplification is applied only to compositions that have already passed validation, and
+the simplified form is re-validated before registration. This double validation ensures
+that the simplification process — which modifies argument indices and removes
+composition steps — has not introduced an error through an incorrect index remap or
+an incorrect column mapping.
+
+Constant fitting is governed by two independent criteria: the least-squares fit must
+produce a finite, nonzero coefficient, and the R2 of the fitted expression against the
+original examples must exceed 0.999. Either criterion alone would be insufficient.
+The coefficient check prevents degenerate fits where the produced values are all zero.
+The R2 threshold prevents accepting expressions that are merely correlated with the
+target rather than symbolically equivalent up to a scale factor.
+
+5.4 Quality Assurance View
+
+Consistency is enforced by the deterministic executor. Given the same inputs and the
+same composition graph, the executor always produces the same result. This makes the
+registry auditable at any time: any registered function can be re-run against its original
+examples to confirm that the stored composition matches its stated behavior. No runtime
+randomness enters the execution path.
+
+Repeatability is supported by a fixed random seed in the curriculum task generator
+(seed 777) and by the deterministic encoding function. Two runs starting from the same
+checkpoint and database state, presented with the same task, produce the same encoding,
+the same initial TRM predictions, and the same candidate generation sequence. The only
+source of non-determinism in the search is the small carry noise added between steps
+to encourage exploration; this is drawn from a fixed distribution but not seeded per task.
+
+Traceability is provided by the server's streaming log output, which records TRM
+predictions at each search step with their probabilities, descriptions of all near-miss
+candidates with their R2 scores, the accepted composition before and after simplification,
+and the R2 score of the registered function against the original examples. These logs
+form a complete record of every discovery session and can be used to diagnose why a
+particular search succeeded or failed.
+
+5.4.1 Review Checkpoints
+
+Four natural review checkpoints arise in each learn cycle. After encoding, the tensor
+shapes and value ranges should match expectations for the given input dimensions and
+example count. After search, the accepted candidate should describe a plausible
+composition and pass a sanity check against at least one example before being submitted
+to the simplifier. After simplification, the composition graph should be no longer and
+no wider than the presimplification version. After registration, the database record should
+be queryable through the registry's get_function interface and the registered callable
+should produce the expected output on the training examples.
+
+5.4.2 Failure Handling
+
+When search fails to find any exact or constant-fit candidate within the allotted steps,
+the learn function returns a failure indicator alongside the best-attempt R2 score from
+the near-miss candidates. The server reports this to the caller without registering anything.
+The registry remains consistent because no partial registration is ever committed to the
+database — the database write and the in-memory state update happen together or not
+at all.
+
+When a composition step raises an exception during execution — division by zero,
+a LOOP body that produces a non-numeric value, or any other runtime error — the
+executor catches the exception and returns False from the validate call. Malformed or
+numerically dangerous compositions are therefore rejected at validation time rather than
+causing crashes in the search loop or the server process.
+
+When the checkpoint directory is not writable, the training loop completes and the
+function is registered normally, but the checkpoint save fails and the failure is reported
+separately in the server log. Discovery and registration proceed; only the checkpoint is
+lost. On the next successful save, the checkpoint will reflect the current vocabulary size
+and model state, so the loss is bounded to the functions registered in the interval between
+the failed save and the next successful one.

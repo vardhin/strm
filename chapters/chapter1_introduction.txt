@@ -1,0 +1,282 @@
+                                  1. INTRODUCTION
+
+1.1 Background
+
+Modern machine learning systems have grown remarkably capable at prediction, yet their
+outputs remain fundamentally opaque. A regression model that achieves low error on
+held-out data still cannot tell an engineer what relationship governs the data — only that
+some relationship exists. In engineering, physics, laboratory analysis, and embedded
+systems diagnostics, the useful product is not a probability score but a readable equation
+that can be inspected, communicated, and applied independent of the model that produced
+it.
+
+Symbolic regression addresses this gap by searching explicitly for mathematical
+expressions rather than fitting weights inside a fixed architecture. The challenge is that
+the search space over symbolic expressions grows combinatorially, and most competitive
+approaches rely on genetic algorithms, reinforcement learning with large policy networks,
+or solver infrastructure that assumes substantial compute. These methods do not translate
+well to environments where a small device operates locally with limited memory, no GPU,
+and no persistent network connection.
+
+NSSR was built to occupy a specific position in this landscape: symbolic discovery that
+runs on CPU-only hardware, produces exact or near-exact interpretable expressions,
+stores discovered knowledge durably, and improves its search capability over time through
+a growing vocabulary of reusable symbolic building blocks.
+
+1.1.1 Overview of the Problem Domain
+
+The problem begins with a small collection of structured input-output pairs. The inputs
+are numeric vectors — columns of measurements, sensor readings, or computed features
+— and the output is a scalar that follows some unknown symbolic rule. The goal is to
+recover that rule as a closed-form expression, composed from a defined set of primitive
+operations and any functions the system has previously discovered.
+
+Users who benefit from this kind of system tend to need transparency rather than raw
+predictive power. Researchers verifying a physical hypothesis, engineers calibrating
+instruments, and developers building monitoring logic for embedded systems all share a
+need for outputs they can read, question, and justify to others. A discovered expression
+that exactly matches the data is far more useful in these contexts than a high-dimensional
+model with equivalent predictive performance.
+
+The operating constraint throughout is that the solution must function without cloud
+services, large memory allocations, or hardware accelerators. Discovery, verification,
+and storage all happen locally.
+
+1.1.2 Current Systems and Existing Solutions
+
+Several classes of existing work are relevant to NSSR's design.
+
+Genetic and evolutionary symbolic regression systems like PySR search expression space
+using population dynamics. They are effective for discovering complex symbolic forms
+but typically assume CPU or GPU time on the order of minutes to hours, and their
+search does not benefit from accumulated prior knowledge — each problem is solved from
+scratch.
+
+Deep symbolic regression approaches, including the policy-gradient method of Petersen
+et al. (2021), use neural networks to guide the search over expression trees. These
+produce interpretable outputs and can be quite accurate, but the neural guidance
+component is itself a moderately large model trained on expression distribution data,
+which does not run efficiently on a microcontroller or single-board computer.
+
+Library learning systems such as DreamCoder demonstrate that reusable symbolic
+abstractions can be learned over time through a wake-sleep cycle of abstraction and
+compression. This is conceptually close to what NSSR does with its registry, but
+DreamCoder targets batch compute and does not produce the kind of incrementally
+updated, locally persistent registry that NSSR requires.
+
+Continual learning research addresses catastrophic forgetting in neural networks but
+rarely in a setting where the growing output space is a symbolic vocabulary that must be
+represented in the model's own prediction heads. Inference-only edge AI focuses on
+running existing models efficiently on small devices, stopping well short of symbolic
+discovery.
+
+1.1.3 Limitations of Existing Systems
+
+The most consequential limitation of heavy symbolic search systems is their
+impracticality for edge deployment. Genetic search over complex grammars and large
+policy networks require memory and wall-clock time that scale poorly to constrained
+hardware. Porting these systems to a Raspberry Pi or equivalent single-board computer
+is not a configuration question — it would require fundamental architectural changes.
+
+Fixed symbolic vocabularies are a second limitation. Most existing systems define a
+grammar or token inventory at the start and never extend it. A function discovered while
+solving one task cannot be reused when solving the next. The system cannot accumulate
+symbolic capital across problems.
+
+Heuristic acceptance is a third concern. When a candidate is accepted because its reward
+is high or its neural confidence score exceeds a threshold, the acceptance decision is not
+grounded in direct evaluation against the data. NSSR requires each candidate to pass
+exact execution against all training examples and a holdout split before registration —
+the acceptance criterion is deterministic, not probabilistic.
+
+Finally, most of these systems treat each learning session as isolated. Discovered
+expressions are returned to the user but not stored in a form that benefits future searches.
+If the system restarts, all prior context is lost.
+
+1.1.4 Relevant Technologies and Concepts
+
+Transformer architectures, specifically the self-attention mechanism of Vaswani et al.
+(2017), form the backbone of the TRM. Pre-norm transformer blocks with residual
+connections provide stable training even when the same block is applied many times in
+sequence, which is essential for recursive reuse.
+
+Recursive reasoning, as formalized by Jolicoeur-Martineau (2025) in "Less is More:
+Recursive Reasoning with Tiny Networks", shows that a small transformer applied
+iteratively can perform tasks that would require a much deeper network if applied once.
+The key observation is that reasoning depth and parameter count need not scale together.
+This makes recursive architectures attractive wherever memory is constrained.
+
+Adaptive computation time, originally proposed for recurrent networks, provides the
+halting mechanism used in NSSR's training regime. A learned halt head allows the TRM
+to signal when further recursion is unlikely to improve predictions, enabling early exit
+from the search loop without a fixed step limit.
+
+SQLite provides the persistence layer. Its single-file, zero-configuration design fits the
+edge deployment assumption: no separate database server, no network socket, no
+administration overhead. Discovered functions are stored as JSON-serialized composition
+graphs alongside their constant fits and layer assignments.
+
+Replay-based continual learning, drawing on the ideas behind experience replay in
+reinforcement learning and its adaptation to supervised settings, provides the forgetting
+mitigation strategy. Rather than selecting which tasks to replay based on gradient
+statistics, NSSR replays all previously discovered tasks after every new registration.
+
+1.1.5 Theoretical Foundations
+
+The system rests on a separation between guidance and verification. The TRM is
+responsible for proposing symbolic structures that are likely to match the data; the
+symbolic executor is responsible for determining whether they actually do. These two
+roles require different properties. The proposer benefits from being probabilistic and
+approximate — high recall of plausible candidates matters more than precision, because
+the executor filters the result. The executor must be exact — accepting a candidate that
+does not match the data would corrupt the registry and mislead future searches.
+
+This separation also motivates the design of the carry state. The TRM maintains two
+tensors across recursion steps: a reasoning state that integrates information from the
+input and evolves across steps, and an answer state from which the output heads read.
+By training the network to refine the answer state through repeated passes rather than
+committing to a prediction after one forward pass, the system learns to iteratively improve
+its proposals in a way that mirrors how search is actually conducted at inference time.
+
+Compositional reuse is the third foundational principle. Once a function is verified and
+registered, it becomes a first-class member of the symbolic vocabulary. Future searches
+can compose it with other functions at any depth. This transforms the system from a
+one-time solver into an accumulating workspace: harder problems become reachable as
+easier ones are solved.
+
+1.1.6 Need for the Proposed System
+
+The case for NSSR is most concrete in contexts where interpretability, privacy, and
+resource constraints are all active simultaneously. A laboratory instrument that discovers
+its own calibration equation, stores it locally, and reuses it in downstream analyses does
+not need a cloud connection. An industrial sensor that infers a physical relationship from
+measurements and expresses that relationship as an auditable symbolic form is easier to
+certify and maintain than one that produces a neural approximation of unknown
+provenance.
+
+Beyond the practical case, there is an architectural gap. No existing lightweight system
+simultaneously performs verified symbolic discovery, stores results as a reusable
+vocabulary, expands that vocabulary over time, and mitigates forgetting through replay
+— all within a CPU-only memory budget. NSSR was designed to fill that gap.
+
+1.2 Motivation
+
+The primary motivation behind NSSR is the observation that many engineering and
+scientific workflows are currently forced to choose between two unsatisfactory options:
+use a black-box model that is accurate but uninterpretable, or derive equations manually,
+which is slow, domain-specific, and does not benefit from automation. A system that
+discovers exact symbolic expressions automatically, verifies them against data, and
+accumulates them for reuse offers a third path that was not practically reachable on
+constrained hardware before the adoption of recursive compact architectures.
+
+1.2.1 Problem Significance
+
+In settings governed by regulation or safety review, the inability to explain a model's
+output is not merely inconvenient — it can be a disqualifying property. Symbolic
+expressions are auditable in a way that neural weights are not. An equation can be
+checked by domain experts, verified against physical constraints, and communicated in
+publications or technical reports without any loss of fidelity.
+
+The problem is also significant from a lifecycle perspective. A model that produces
+symbolic outputs creates assets that outlast the system that generated them. An equation
+discovered today can be used in a spreadsheet, embedded in firmware, or incorporated
+into a formal specification tomorrow. A neural approximation cannot be applied this way.
+
+1.2.2 Practical Motivation
+
+Field deployment motivates several specific design choices. Edge devices — Raspberry
+Pi boards, microcontrollers with Python runtimes, and similar hardware — often operate
+in environments where network connectivity is intermittent or unavailable. Running
+discovery locally eliminates the latency and reliability concerns associated with cloud
+inference. Storing results in an embedded SQLite database means the function registry
+survives power cycles, operating system updates, and hardware replacement without
+external coordination.
+
+The privacy motivation reinforces this. Raw measurement data from laboratory or
+industrial settings may carry confidentiality requirements. Keeping discovery local means
+sensitive data never leaves the device.
+
+1.2.3 Academic Motivation
+
+From a research perspective, NSSR occupies an underexplored intersection. Symbolic
+regression has an established literature, continual learning has a growing one, and compact
+transformer architectures are an active area of investigation. Combining recursive
+reasoning with symbolic program synthesis in a continual, vocabulary-growing setting
+is novel enough to contribute to all three areas while remaining grounded in a working
+implementation.
+
+The project also provides an opportunity to study how the effective depth of a recursive
+network affects the quality of symbolic search guidance, how head expansion in a
+classification network interacts with catastrophic forgetting prevention, and whether
+exact-match verification is a sufficient acceptance criterion when combined with
+constant fitting for near-miss recovery.
+
+1.2.4 Technical Interest
+
+The recursive architecture itself is technically interesting independent of its application.
+Achieving 42 effective transformer layers from two actual parameter layers, with a
+memory footprint that fits comfortably in a few hundred megabytes of RAM, represents
+a meaningful demonstration of the efficiency gains available through architectural
+recursion rather than architectural depth. The interplay between the no-gradient pre-
+passes and the single gradient pass in deep recursion is a subtle training mechanism
+worth studying in its own right.
+
+The head expansion mechanism is also noteworthy. Growing a classification head without
+disrupting previously learned weights is not trivially solved. Initializing new rows near
+the empirical mean of existing weights was chosen over random initialization to reduce
+the perturbation to the optimizer's adaptive moment estimates.
+
+1.2.5 Innovation and Improvement Aspect
+
+NSSR improves on static-vocabulary symbolic regression by allowing the vocabulary to
+grow through validated discovery. Each registered function becomes a candidate building
+block for future compositions, so the search space expands upward in complexity as the
+system solves easier problems. This is qualitatively different from a system with a fixed
+grammar: the set of expressible relationships is not determined at design time.
+
+The deep supervision training regime improves on single-shot prediction in a way that
+aligns training with inference. At search time, the TRM is called repeatedly and its
+predictions are read at each step. Training the model to produce useful predictions at
+every supervision step — not just the last — means the model's behavior during search
+is consistent with how it was optimized.
+
+1.3 Scope of the Project
+
+The project covers the full pipeline from raw input-output examples to a persistently
+stored, reusable symbolic expression. Within this scope, the primary focus is on the
+backend architecture: the TRM model, the search and validation logic, the registry, and
+the continual learning mechanisms. The frontend serves as an accessible interface to
+these backend capabilities and receives proportionally less emphasis in this report.
+
+1.3.1 Functional Scope
+
+The functional scope includes accepting structured numeric examples, encoding them for
+the TRM, running TRM-guided combinatorial search, executing and verifying candidates,
+fitting constants for near-miss recovery, simplifying accepted compositions, registering
+validated functions, and replaying prior tasks to mitigate forgetting. The system also
+exposes all of these capabilities through a REST API.
+
+1.3.2 Non-Functional Scope
+
+The system targets CPU-only edge hardware. Memory usage, inference latency, and
+database size are treated as design constraints rather than afterthoughts. Discovered
+outputs must be human-readable and technically defensible. The registry must survive
+power interruption and restart. Training behavior must be reproducible across equivalent
+hardware configurations.
+
+1.3.3 Technical Scope
+
+The technical scope includes the transformer architecture, recursive training scheme,
+six composition types, eighteen primitive functions, NULL-based column elimination,
+holdout-validated acceptance, SQLite persistence, FastAPI server, and SvelteKit frontend.
+The scope does not include custom hardware design, FPGA or ASIC deployment,
+distributed training, or symbolic simplification beyond step pruning and column stripping.
+
+1.3.4 Project Boundaries
+
+This report does not present NSSR as a production system ready for large-scale industrial
+deployment. The experiments described are designed to validate the core mechanisms
+— symbolic discovery, vocabulary growth, forgetting mitigation, and noise tolerance —
+not to benchmark against the full field of symbolic regression on standard datasets. The
+comparison with prior work is framed in terms of architectural properties rather than
+competitive empirical performance numbers.

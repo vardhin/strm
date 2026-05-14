@@ -1,0 +1,538 @@
+                              4. SYSTEM DESIGN
+
+4.1 System Architecture
+
+The overall pipeline runs in six stages. Raw examples enter through an encoding stage
+that converts numeric values into multi-feature tensor representations. The TRM reads
+these representations and emits ranked predictions across five output heads. The search
+stage uses those predictions to generate a structured set of candidate compositions. Each
+candidate is executed against the examples by a deterministic symbolic executor and
+validated against a holdout split. The best passing candidate is simplified, then registered
+in the SQLite database as a new reusable function. Finally, the TRM is retrained on all
+previously known tasks to consolidate what was just learned.
+
+Every stage has a clean handoff to the next. The encoder produces a tensor that only the
+TRM sees. The TRM produces logits that only the search stage reads. The search stage
+produces candidates that only the executor evaluates. The executor produces Boolean
+results that the search stage uses to filter. The simplifier receives a verified composition
+and returns a shorter equivalent. The registry receives the simplified composition and
+persists it. The training loop receives the full replay buffer and updates the model. No
+stage reaches across this chain to inspect or modify another stage's internals.
+
+4.1.1 Input Encoding and Representation Design
+
+Each numeric value in the example table is encoded as a four-dimensional feature vector.
+The first feature is the value normalized by dividing by 100, providing a roughly unit-
+scale representation for typical measurement ranges. The second is the sign, represented
+as +1 or -1. The third is the base-10 logarithm of one plus the absolute value, which
+captures magnitude across several orders of scale without the asymptotic behavior of raw
+log near zero. The fourth is the fractional part of the value, which distinguishes integer-
+valued inputs from continuously-valued ones.
+
+This encoding produces a tensor of shape (batch_size, seq_len, input_dim) where
+seq_len=8 and input_dim=32. The 32-dimensional input feature space was chosen to
+give the positional embedding and attention mechanism enough resolution to distinguish
+the contribution of each input column from the structure of its values. The encoding
+is computed once per task and reused across all supervision steps in a training epoch
+and across all search steps during inference. Being stateless and vectorized, it reproduces
+exactly across restarts given the same examples.
+
+4.1.2 TRM Proposal Design
+
+The TRM is a two-block pre-norm transformer with d_model=128, eight attention heads,
+and a 512-dimensional feed-forward layer. These parameters keep the model well under
+10 million parameters — small enough to train and run on CPU hardware with modest
+memory — while giving each attention head 16 dimensions of query-key-value space,
+sufficient for the kind of structured pattern matching required in symbolic prediction.
+
+The recursive structure applies these two blocks iteratively rather than stacking more
+blocks. One full latent recursion cycle consists of n=6 refinement steps applied to the
+latent reasoning state z, followed by one step applied to the answer state y. With T=3
+deep recursion cycles, the effective depth is:
+
+    T * (n + 1) * n_layers = 3 * 7 * 2 = 42 equivalent transformer layers
+
+from only two actual parameter layers. The first T-1 cycles run without gradient
+computation, providing a warm carry state that the final gradient-computed cycle then
+refines. This means the gradient applies to a carry that is already partially converged,
+producing more useful parameter updates than applying the gradient to a zero-initialized
+carry would.
+
+The choice to separate the reasoning state z from the answer state y was deliberate. The
+reasoning state receives input at every refinement step and is updated using the combined
+signal from x+y+z. The answer state is updated only in the final step of each latent
+recursion cycle, and that update sees y+z but not x. This asymmetry forces the network
+to learn a distinction between integrating new evidence from the input and updating its
+answer hypothesis — a separation that improves the stability and coherence of predictions
+across successive supervision steps.
+
+Five output heads read from the mean-pooled answer state y. The primary head predicts
+which function to use as the outermost operator. The secondary head predicts the inner
+function in sequential or nested compositions. The tertiary head predicts the combiner
+function in parallel compositions. The composition type head chooses among four
+strategies: none, sequential, nested, and parallel. The halt head predicts whether the
+model's answer has converged, enabling early exit from the search loop when the carry
+has stabilized without requiring a fixed step limit.
+
+4.1.3 Combinatorial Search and Candidate Generation Design
+
+Given the TRM's top-k predictions from each head, the search stage generates candidate
+compositions at three depth levels.
+
+At depth 1, the search generates single-function candidates. For each function in the
+top-k primary prediction list, variants are generated that route different subsets of input
+columns into the function's arguments. Columns not routed are replaced by the NULL
+primitive, which always returns zero, effectively marking them as irrelevant to that
+candidate.
+
+At depth 2, the search generates binary compositions from top-k combinations of primary
+and secondary predictions, across all four composition types and all NULL-column
+subsets. Parallel candidates additionally enumerate routing combinations from the tertiary
+head predictions, capped at 30 per (primary, secondary, tertiary) triple to prevent
+combinatorial explosion. LOOP candidates are also generated at this depth for unary and
+binary body functions, enabling the system to discover iterative relationships like
+ADD(a, b) expressed as LOOP(INC, b, a), or MUL(a, b) as LOOP(ADD, b, 0, a).
+
+At depth 3, the search combines the TRM's top-k predictions with all currently registered
+learned functions, not just those predicted by the TRM. This opens the search to multi-
+step compositions that reuse previously discovered vocabulary, making complex targets
+reachable once simpler subexpressions have been registered.
+
+Temperature scaling controls the diversity of top-k sampling. Temperature starts at 2.0
+and decays by 0.05 per search step, progressively narrowing the search as the carry
+state converges. If the first search attempt fails, a retry adds a temperature boost to re-
+diversify the proposals before the carry resets.
+
+4.1.4 Verification and Constant Fitting Design
+
+Candidate verification uses the symbolic executor to run each composition step-by-step
+against the training examples and a holdout split. The holdout is one-third of the available
+examples, selected once per task and held fixed across all search steps. A candidate must
+produce the correct output for every example in both splits to be accepted.
+
+Floating-point equivalence is checked with math.isclose using rel_tol=1e-6 and
+abs_tol=1e-9. This tolerance accommodates the accumulation of floating-point rounding
+error across composition steps while remaining tight enough to reject candidates that are
+merely correlated with the target rather than symbolically equivalent.
+
+When no candidate passes exact validation, the search attempts constant fitting on the
+near-miss candidates scored by R2. Two fitting modes are tried in order. The
+multiplicative fit computes:
+
+    k = sum(produced * expected) / sum(produced^2)
+
+by least squares. The additive fit computes the mean of (expected - produced) and
+accepts only when all individual differences are within 1e-6 of that mean — confirming
+that the offset is truly constant rather than a rough average of a varying gap. A candidate
+with a fitted constant is accepted only when its R2 against the original examples exceeds
+0.999. This threshold was chosen to be tight enough to reject coincidental near-misses
+while permitting physically meaningful scaled relationships like kinetic energy, where
+the factor of 0.5 is exact.
+
+4.1.5 Simplification Design
+
+After a candidate passes verification, the simplifier applies three strategies in order to
+produce the most concise equivalent expression before registration.
+
+Strategy 1 checks whether any existing registered function already matches the examples
+exactly. If so, the entire candidate is replaced by a single reference to that function,
+avoiding duplicate registrations. This strategy is skipped when constants are involved,
+because a constant fit produces a unique scaled version of an existing function that
+deserves its own registry entry.
+
+Strategy 2 tries removing each non-final step from the composition and retesting the
+shortened version against all examples. When a step can be removed without changing
+the output, the composition is compacted. Argument indices that referenced the removed
+step are remapped to the step's inputs. This catches cases where the search assembled
+a longer path to a result that a shorter path already achieves.
+
+Strategy 3 identifies input columns that no composition step ever references and removes
+them from the function's input signature. A three-column composition that uses only
+columns zero and two becomes a two-column composition with remapped indices.
+This reduces arity, which makes the function more composable in future searches and
+easier to read in the registry browser.
+
+Complexity is scored as n_terms * 100 + max_layer * 10 + total_args. Lower scores
+are preferred, with the number of composition steps weighted most heavily. When
+multiple simplifications are possible, the one with the lowest complexity score is kept.
+
+4.1.6 Registry and Persistence Design
+
+The SQLite database holds a single functions table. Every function — primitive or
+learned — is represented as a row with an integer primary key, a unique name, an arity,
+a layer number, a JSON-serialized composition graph, and optional constant fields. Layer
+is computed automatically as one plus the maximum layer among all child functions in
+the composition. Primitives have layer zero and a null composition field.
+
+Composition steps are stored as a list of (child_function_id, [arg_indices]) pairs.
+Arg indices reference positions in an available_values list that grows during execution:
+it starts with the raw inputs and gains one entry per completed step. A special index of
+-1 refers to the literal value zero, used by the LOOP primitive to implement MUL as
+LOOP(ADD, b, 0, a) where the -1 slot provides the initial accumulator value.
+
+Constants are stored as a list alongside a const_mode string — either "multiplicative"
+or "additive". The executor applies constants at the end of composition execution after
+all steps have been evaluated. The registry state in memory is a plain Python dictionary
+holding a functions map from id to callable, a metadata map from id to descriptive
+fields, a next_id counter, a cached loop_id for LOOP primitive lookup, and a replay
+buffer list of all previously solved tasks.
+
+4.1.7 Replay and Continual Learning Design
+
+After each new function is registered, the TRM undergoes full replay training across all
+tasks in the replay buffer. The replay buffer is initialized on the first call to learn with
+curriculum tasks generated from all known primitives: each primitive receives a clean
+task with ten examples and a noisy variant where irrelevant columns are inserted, teaching
+the TRM about NULL column elimination from the start. Composition examples covering
+sequential, nested, and parallel patterns are also included in the initial curriculum.
+
+Replay training proceeds in curriculum order — simpler tasks before more complex ones,
+based on layer number — with two epochs per task per replay pass. Early stopping with
+patience of five epochs prevents unnecessary training when the loss has stabilized.
+The full-replay approach was chosen over selective replay because it requires no
+importance weighting, no gradient statistics, and no per-task bookkeeping beyond storing
+the examples and target metadata.
+
+When a new function is registered, the output heads must expand to accommodate it.
+New linear layers for the primary, secondary, and tertiary heads are created with the new
+vocabulary size. Existing weights are copied into the first old_n rows exactly. New rows
+are initialized with small Gaussian noise around the mean of the existing rows, with
+standard deviation equal to one-tenth of the standard deviation of existing weights.
+This initialization ensures new functions start with logit values in the same range as
+established ones, avoiding the cold-start problem where a new function is systematically
+underrepresented in top-k sampling for the first several training epochs after expansion.
+The optimizer is recreated after head expansion to reset its moment estimates for the
+newly added parameters.
+
+4.2 Detailed Design
+
+4.2.1 TRM Architecture
+
+The TRM class contains an input projection layer that maps the 32-dimensional input
+features to d_model=128, a set of learned positional embeddings of shape (seq_len,
+d_model), and n_layers=2 instances of the _Block class. A single layer norm is shared
+across all recursion steps to stabilize the sum x+y+z before it enters the transformer
+blocks. Without this normalization, repeated addition of three evolving tensors produces
+values that grow quadratically and cause NaN loss within the first few training steps,
+particularly on tasks with large input values.
+
+Each _Block applies pre-norm layer normalization before multi-head self-attention with
+eight heads, followed by a residual connection, another layer normalization, a two-layer
+feed-forward network with GELU activation and 0.1 dropout, and a second residual
+connection. The pre-norm arrangement — where normalization precedes the attention
+and FFN operations rather than following them — was chosen because it provides more
+stable gradients during recursive application. In post-norm transformers, the residual
+bypass carries unnormalized values that can destabilize training when the same block
+is applied many times in sequence.
+
+The five output heads are all linear projections from d_model to their respective output
+sizes. Primary, secondary, and tertiary heads project to n_functions. The composition
+type head projects to 4. The halt head projects to 1 and passes through a sigmoid for
+probability interpretation during inference.
+
+4.2.2 Carry State and Recursion Levels
+
+The Carry dataclass holds four fields: y (the answer tensor of shape batch * seq_len *
+d_model), z (the latent reasoning tensor of the same shape), a steps counter, and a
+halted boolean mask. Both y and z are initialized to zero at the start of each search or
+training episode.
+
+One latent recursion cycle applies the transformer blocks n=6 times to update z, using
+the normalized sum x+y+z as input at each step. After these n steps, one additional
+application updates y using y+z without x. This final y-only step is the mechanism by
+which the model learns to update its answer based on what reasoning has accumulated
+in z, rather than re-reading the input directly to produce the answer. The absence of x
+in this step is not an oversight — it is the architectural choice that produces the
+separation between reasoning and answer updating.
+
+Deep recursion runs T=3 latent cycles. The first T-1=2 cycles run inside
+torch.no_grad(), meaning their forward pass values update y and z but no gradient
+buffers are allocated. Only the final cycle runs with gradients enabled. This gives the
+carry state two passes of unconstrained refinement before the gradient-computing pass,
+which means the gradient applies to a carry that is already partially converged.
+
+One deep supervision epoch calls the TRM's forward function N_sup=16 times. After
+each call, the carry is detached from the computation graph before the next call begins.
+Loss is accumulated across all 16 calls, and the accumulated gradient is applied once
+per epoch with gradient clipping at max norm 1.0. This forces the model to produce a
+useful output at every step, not just at convergence, which aligns training behavior with
+the search-time usage pattern where predictions are read at each step regardless of
+whether the carry has fully stabilized.
+
+4.2.3 Output Heads and Vocabulary Expansion
+
+The five output heads read from the mean of y across the sequence dimension, producing
+a single vector of shape (batch, d_model) that summarizes the current answer state.
+Each head is a linear layer applied to this pooled representation.
+
+Training loss is a weighted sum of five components. Primary, secondary, and tertiary
+function predictions use cross-entropy loss against the correct function id targets.
+Secondary loss is down-weighted to 0.1 when no secondary function is involved in the
+target composition, and tertiary loss receives the same treatment when no tertiary
+function is involved. Down-weighting rather than zeroing these losses keeps the
+corresponding heads active during training on simpler compositions, preventing them
+from drifting to trivially predict a single dominant function.
+
+Composition type prediction uses cross-entropy against the correct type index. Halt
+prediction uses binary cross-entropy against a target of 1.0 on the final supervision step
+and 0.0 on earlier steps. Entropy regularization with weight 0.05 is added to the three
+function prediction heads to prevent the softmax from collapsing to always predict the
+most frequently encountered function, which would starve less common functions of
+top-k representation during search.
+
+4.2.4 Composition Types
+
+NSSR supports six composition types that together cover single applications, unary and
+binary functional combinations, parallel branching, and iterative structures.
+
+The none type applies a single function to the routed inputs. No secondary or tertiary
+function is involved. This is the simplest discoverable form and is always included in
+the candidate set regardless of TRM predictions.
+
+The sequential type chains two functions: the secondary function processes the inputs,
+and the primary function takes the output of the secondary as its sole argument. This
+discovers forms like INC(MUL(a, b)), incrementing the product of two inputs.
+
+The nested type applies the secondary function to each input column independently,
+then combines all results using the primary function. For a two-column input this
+produces primary(secondary(a), secondary(b)), discovering forms like
+ADD(SQUARE(a), SQUARE(b)) — the sum of squares.
+
+The parallel type routes two different subsets of the input columns through the primary
+and secondary functions respectively, then combines both results using the tertiary
+function. This discovers forms like ADD(MUL(a, b), INC(c)) where three input columns
+feed into three distinct operations.
+
+The loop_direct type implements unary iteration using the LOOP primitive:
+LOOP(body, count, init) applies body to the current state count times, starting from
+init. This expresses ADD(a, b) as LOOP(INC, b, a) — increment a exactly b times.
+
+The loop_binary type implements binary iteration: LOOP(body, count, 0, step_arg)
+applies body to the current state and a fixed step argument count times, starting from
+zero. This expresses MUL(a, b) as LOOP(ADD, b, 0, a) — add a to the accumulator
+exactly b times.
+
+The loop composition types map to composition index 0 in training (the same as none)
+because they are generated and handled separately from the four TRM-predicted types.
+This keeps the composition head's output space at four classes while still supporting
+iterative discoveries during search.
+
+4.2.5 NULL-Based Column Elimination
+
+Many real input tables contain columns that do not contribute to the target output.
+Pre-selecting relevant columns requires domain knowledge that the system should not
+depend on. NULL-based column elimination handles this automatically within the search,
+without any change to the primitive vocabulary or composition grammar.
+
+The NULL primitive is a unary function that always returns zero. When a column is
+routed through NULL before entering a composition, its contribution is zeroed out
+regardless of its actual value. The search generates subsets of columns to keep — all
+columns, each column individually, all pairs, and all triples for inputs with four or more
+columns — and for each subset routes kept columns into function argument slots with
+repetition allowed.
+
+Repetition in routing is the key mechanism for expressions like SQUARE(a), which
+requires the same column to appear in both argument slots of MUL. When only one
+column is kept and routed into a two-argument function, both slots receive the same
+value, making x*x discoverable from a one-column routing without any special-case
+handling.
+
+The noise column experiment validated this mechanism under three conditions: purely
+random junk columns with zero signal, columns correlated with meaningful inputs
+creating a multicollinearity condition, and multi-step synthesis tasks where both noise
+tolerance and compositional reuse are simultaneously required. In the multicollinearity
+case, the holdout split provides additional protection: a spurious relationship that fits
+the training examples through the correlated column will fail to generalize to the holdout
+because the correlation is imperfect.
+
+4.2.6 Primitive Function Set
+
+The eighteen built-in primitives form layer zero of the registry. Every learned function
+has a layer greater than zero, computed as one plus the maximum layer among its
+component functions.
+
+Bitwise operations — OR, AND, NOT — enable discovery of logical relationships.
+Arithmetic operations — ADD, SUB, MUL, INC, DEC, DIV, SQUARE, ABS, and
+MULTIPLICATIVE_INV — cover the most common algebraic forms. DIV returns 0.0
+when the divisor is zero rather than raising an exception, which allows division
+candidates to be evaluated safely across all examples regardless of input values.
+
+Comparison operations — LT, LTE, GT, GTE, EQ, NEQ — produce integer-valued
+Boolean outputs (0 or 1) that can serve as inputs to COND. The COND primitive
+implements if-then-else: it returns its second argument when its first is nonzero, and
+its third argument otherwise. CONST returns its input unchanged, useful as an identity
+step in compositions. NULL always returns zero.
+
+The three iteration primitives — LOOP, WHILE, and ACCUM — are variadic and
+enforce a hard limit of 1000 iterations each. LOOP is the most commonly used,
+enabling multiplication through iterated addition and exponentiation through iterated
+multiplication. WHILE iterates a body function while a condition function returns
+nonzero. ACCUM iterates a body while counting the number of iterations, returning the
+counter rather than the final state.
+
+4.2.7 Training with Deep Supervision
+
+Standard supervised training computes loss once per forward pass. Deep supervision
+computes loss at every supervision step within the same epoch. The training loop creates
+a fresh carry at the start of each epoch, then calls the TRM's forward function N_sup=16
+times in sequence. After each call, the carry is detached — its values are passed forward
+to the next step but no gradients flow backward through the entire unrolling chain.
+Loss is accumulated across all 16 steps and a single optimizer step is taken per epoch.
+
+This training scheme produces two benefits. The first is that it forces the model to be
+useful at every step. A carry that produces poor predictions on step 3 will contribute a
+large loss component regardless of whether the carry improves by step 16. The second
+is that it aligns training with inference: at search time, predictions are read at each step
+and the best candidate found at any step is returned. A model trained on single-step
+prediction is not necessarily better at step 3 than step 1; a model trained with deep
+supervision is explicitly optimized to improve across steps.
+
+The ACT-style halt mechanism allows early exit from the supervision loop when the
+halt head's mean probability across the batch exceeds 0.5, provided at least one step
+has already completed. This saves training time on tasks where the carry converges
+quickly — which tends to happen for simpler tasks once the TRM has been trained on
+several related ones.
+
+4.2.8 Catastrophic Forgetting Prevention
+
+Adding a new function to the registry expands the output head dimensions and alters
+the distribution of the optimizer's momentum terms. Without intervention, subsequent
+training on new tasks would shift the model away from the parameter regions that produce
+correct predictions for earlier tasks.
+
+Three mechanisms act together to prevent this. Full replay trains the model on every task
+in the replay buffer, in curriculum order, after every new registration. This ensures that
+gradient updates for new tasks are always accompanied by gradient updates for old tasks,
+preventing one-sided parameter drift.
+
+Deep supervision with detached carry provides a second form of regularization. Because
+loss is accumulated across all supervision steps, a perturbation that causes the model to
+lose accuracy on step 8 for an old task will be penalized even if step 16 accuracy is
+maintained. This makes the model's trajectory across steps robust, not just its final state.
+
+Head initialization near the existing mean provides a third form of protection. New
+function rows in the output heads start with logit values similar to established functions.
+The softmax over the expanded vocabulary therefore starts approximately uniform for
+the new entry relative to established ones, rather than systematically over- or under-
+weighting it. This means early post-expansion training does not aggressively re-rank
+established functions to accommodate the new entry.
+
+4.2.9 Persistence and Checkpointing
+
+Checkpoints save three components: the model state dictionary, the optimizer state
+dictionary, and the vocabulary size at the time of saving. On load, the checkpoint reader
+compares the saved vocabulary size against the current registry size.
+
+If the saved vocabulary is smaller than the current registry — which happens when new
+functions were registered between the last save and the current startup — the loader
+creates a temporary model with the saved vocabulary size, loads the weights into it,
+resizes heads to match the current vocabulary, and transfers the result. If the saved
+vocabulary is larger than the current registry, the checkpoint is considered stale and is
+rejected, requiring a fresh model initialization.
+
+This handling ensures that checkpoint files remain useful across sessions where the
+registry has grown incrementally. The vocabulary size field in the checkpoint acts as a
+version tag that drives the compatibility logic, making the checkpoint format self-
+describing with respect to head dimensions.
+
+4.3 Module Interaction View
+
+The system is organized into seven functional modules with well-defined handoffs
+between them. Clean module boundaries reduce the risk of hidden coupling between the
+neural scoring logic and the symbolic validation logic — a coupling that would make it
+difficult to test either component independently or to extend one without modifying the
+other.
+
+4.3.1 Input Module
+
+The input module accepts a list of (input_vector, output_scalar) pairs and passes them
+through the format_examples function in search.py to produce a float tensor of shape
+(batch_size, seq_len, input_dim). This tensor is the only representation of the examples
+that the TRM ever sees; all other modules work directly with the raw numeric lists.
+
+The encoding is stateless and deterministic. Given the same examples and configuration,
+format_examples always produces the same tensor. This is important both for
+reproducibility across restarts and for ensuring that training and search use identical
+representations of the same data.
+
+4.3.2 TRM Proposal Module
+
+The TRM module takes the encoded tensor and a carry state, runs one deep recursion
+cycle, and returns an updated carry and a dictionary of five output logit tensors. The
+calling code — either the search loop or the training loop — decides what to do with
+those logits. The TRM has no knowledge of the registry, the examples, or the search
+logic. It produces ranked predictions over the current vocabulary and nothing else.
+
+This separation means the TRM can be retrained on new tasks without touching the
+search logic, and the search logic can be extended with new composition types without
+touching the TRM. The only interface between them is the logit dictionary and the carry
+state, both of which have fixed shapes determined by the configuration.
+
+4.3.3 Search and Executor Module
+
+The search module generates candidates from TRM predictions and validates them using
+the executor module. These two modules are tightly coupled by design: the search
+produces candidates in the exact format the executor expects, and the executor returns
+Boolean results that the search uses to filter the candidate set.
+
+The executor runs a composition step-by-step by maintaining an available_values list.
+At the start of execution, this list contains the raw input values. Each composition step
+appends its output to the list. Arg indices reference positions in this growing list, so
+step n can use the output of any earlier step as an input without any graph traversal
+beyond sequential iteration. This design makes composition graphs naturally acyclic and
+ensures execution terminates in a bounded number of Python function calls.
+
+4.3.4 Simplification Module
+
+The simplification module takes a verified composition and returns the simplest equivalent
+form it can find through the three strategies described in section 4.1.5. It depends on
+the executor module to re-validate candidate simplifications and on the registry module
+to query existing functions for strategy 1.
+
+The simplifier returns three values: the simplified composition, the effective arity after
+column stripping, and a list of original column indices that remain in use. The effective
+arity and used column list are needed by the orchestrator to construct the correct
+composition format for registration, particularly when column stripping has reduced the
+function's input signature from its original width.
+
+4.3.5 Registry Module
+
+The registry module manages the in-memory function state and its SQLite backing store.
+Every function is stored both as a callable in the functions map and as metadata in the
+metadata map. This dual representation means the executor can call functions by id
+without any database access during a search episode, keeping search latency independent
+of database query speed.
+
+The module rebuilds composition closures from database records on startup, ensuring
+the in-memory registry is always consistent with the database even after a restart.
+The rebuild procedure reads composition steps from the database, looks up each child
+function's callable from the functions map (which at rebuild time is populated in layer
+order, guaranteeing that all dependencies are available before dependent functions are
+constructed), and builds a new closure that evaluates the steps sequentially.
+
+4.3.6 Training and Replay Module
+
+The training module implements the deep supervision loop described in section 4.2.7
+and the replay training loop that iterates over all known tasks. These two loops share
+the same inner training logic — compute loss, accumulate gradients, clip, step the
+optimizer — and differ only in how many tasks are presented per pass and whether early
+stopping is applied.
+
+The replay buffer stores tasks as dictionaries containing the examples and the target
+composition metadata. After each new registration, the orchestrator appends the new
+task to the buffer and calls train_on_replay with the full buffer. The buffer grows
+monotonically: tasks are never removed or replaced. This ensures that the gradient
+history the model has received across its lifetime is always recoverable through replay,
+regardless of how many subsequent registrations have occurred.
+
+4.3.7 Checkpoint Module
+
+The checkpoint module saves and loads model and optimizer state from the checkpoints
+directory. It handles vocabulary size mismatches through the resize-and-transfer
+procedure described in section 4.2.9. The checkpoint file is a standard PyTorch state
+dictionary with an additional vocab_size key appended before saving.
+
+Checkpoint saving happens after each completed learn cycle in the server's training
+endpoint, ensuring that progress is not lost if the server is restarted between tasks. On
+server startup, the checkpoint is loaded and the registry is rebuilt from the database,
+restoring the system to exactly the state it was in when it last saved successfully.

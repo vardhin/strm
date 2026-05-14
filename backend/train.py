@@ -1,5 +1,5 @@
 """
-Training for the NSSR TRM model.
+Training for the NSRR TRM model.
 
 Uses deep supervision: each training step runs N_sup supervision steps,
 where the carry (y, z) is detached between steps. This lets the model

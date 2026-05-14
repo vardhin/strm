@@ -1,5 +1,5 @@
 """
-Noise Column Experiment: Can NSSR ignore irrelevant input columns?
+Noise Column Experiment: Can NSRR ignore irrelevant input columns?
 
 Real-world datasets often have columns that are noisy, redundant, or
 completely unrelated to the target. This experiment tests whether the

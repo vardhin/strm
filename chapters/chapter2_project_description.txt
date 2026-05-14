@@ -1,0 +1,179 @@
+                    2. PROJECT DESCRIPTION AND GOALS
+
+2.1 Literature Review
+
+The symbolic regression literature can be organized into roughly four approaches, each
+with properties that illuminate why NSSR makes the design choices it does.
+
+                      Table 3. Prior-Art Orientation Summary
+
+  Direction                  Observed Limitation              NSSR Response
+
+  Heavy symbolic search      Poor edge practicality;          Compact TRM-guided
+  (genetic / evolutionary)   restarts from scratch per task   search with growing registry
+
+  Fixed-vocabulary           No runtime symbolic              Validated rules become
+  neural synthesis           vocabulary growth                future building blocks
+
+  Heuristic acceptance       Weak trust basis for             Exact execution against
+  (reward / confidence)      admitted expressions             data with holdout split
+
+  Inference-only edge        No symbolic discovery;           CPU-native discovery
+  systems                    outputs are not reusable         with local persistence
+
+
+Petersen et al. (2021) introduced deep symbolic regression using risk-seeking policy
+gradients to guide a recurrent network toward valid mathematical expressions. The work
+demonstrated that neural guidance can substantially reduce search time compared to
+genetic methods, but the policy network is itself a moderately large recurrent model
+trained on expression samples, and the acceptance criterion is based on reward thresholds
+rather than exact execution. NSSR adopts the neural guidance idea but uses a far smaller
+recursive transformer and requires exact validation before registration.
+
+Cranmer's PySR (2023) is an efficient open-source implementation of multi-population
+evolutionary symbolic regression. It achieves competitive accuracy on standard benchmarks
+and supports GPU acceleration for large populations. The search is effective but stateless:
+every new problem is solved independently, and discovered expressions are not stored as
+reusable vocabulary entries for subsequent problems.
+
+Ellis et al. (2021) demonstrated library learning through DreamCoder, which alternates
+between a search phase that discovers programs and an abstraction phase that compresses
+repeated substructures into library entries. The library grows over time and makes future
+searches more efficient. This is the closest prior work to NSSR's vocabulary growth
+mechanism, but DreamCoder operates in a batch compute setting with a much larger
+inference model and is designed for program synthesis over combinatorial domains rather
+than continuous symbolic regression from numeric data.
+
+Kirkpatrick et al. (2017) addressed catastrophic forgetting in neural networks through
+elastic weight consolidation, which penalizes parameter changes that would disrupt
+performance on earlier tasks. NSSR takes a simpler and more direct approach: replay all
+previously solved tasks after each new registration. This requires no Fisher information
+computation and is straightforward to implement on a device with limited memory.
+
+Fawzi et al. (2022) used reinforcement learning to discover faster matrix multiplication
+algorithms, demonstrating that search guided by a neural policy can find structured
+symbolic solutions that eluded human designers. The work reinforces the value of neural-
+guided search for combinatorial symbolic problems, though its scope is specialized and
+its compute budget is far beyond edge constraints.
+
+Gulwani et al. (2017) provide a comprehensive survey of program synthesis that frames
+symbolic discovery in terms of search, deduction, and constraint solving. The survey is
+useful for situating NSSR within the broader program synthesis literature, particularly
+regarding the role of examples as specifications and the trade-off between expressiveness
+and tractability.
+
+Jolicoeur-Martineau (2025) introduced the "Less is More" recursive reasoning framework
+that directly inspired the TRM design. The central claim is that a tiny network applied
+recursively with a persistent carry state can match or exceed the reasoning quality of
+much deeper networks applied once. The paper provides the theoretical grounding for
+the latent recursion structure, the separation of reasoning state from answer state, and
+the deep supervision training scheme that NSSR adopts and extends for the symbolic
+search setting.
+
+2.2 Research Gap
+
+No existing system simultaneously satisfies all of the following properties: exact
+execution-based validation, CPU-native operation on constrained hardware, persistent
+and growing symbolic vocabulary, replay-based continual learning, and automatic
+irrelevant-column elimination. Each prior system satisfies some of these properties but
+not all. NSSR was designed to fill that intersection.
+
+The gap in runtime vocabulary growth is particularly consequential. A system that cannot
+reuse prior discoveries must re-derive every subexpression from primitives each time a
+complex target is presented. As tasks grow more compositional, this limitation becomes
+increasingly costly. NSSR's registry converts solved problems into infrastructure for
+future problems, which is a qualitative improvement rather than a simple speedup.
+
+The gap in trust logic is also significant. Many systems rank candidates by learned
+confidence or heuristic reward and accept the highest-ranked result. NSSR grounds every
+acceptance decision in the symbolic executor: a candidate is accepted because it produces
+the correct output for every example in the training and holdout splits, not because a
+neural network assigned it a high probability. This distinction matters when the registry
+is used as the basis for future discoveries — a corrupt entry propagates errors through
+all compositions that depend on it.
+
+2.3 Objectives
+
+The project pursued eight concrete objectives.
+
+First, the system should recover readable symbolic expressions from local input-output
+example data, producing outputs that a domain expert can inspect and apply without
+additional tooling.
+
+Second, the proposal mechanism should remain compact enough to run on modest
+hardware, specifically CPU-only single-board computers with 1 to 4 GB of RAM.
+
+Third, validation should use exact execution against data — with a numerical tolerance
+for floating-point equivalence — and a holdout split to guard against expressions that
+memorize the training examples without generalizing.
+
+Fourth, accepted discoveries should be stored persistently in a local SQLite database and
+remain recoverable across power cycles and restarts.
+
+Fifth, the set of reusable symbolic functions should grow over time as new valid
+expressions are discovered, making progressively more complex symbolic targets reachable.
+
+Sixth, the TRM should remain effective on earlier tasks after new functions are added to
+its output heads, avoiding catastrophic forgetting through full-replay training.
+
+Seventh, the system should handle input tables with irrelevant columns by discovering
+which columns drive the output and excluding the rest within the symbolic expression
+itself, without requiring the user to pre-select features.
+
+Eighth, the overall architecture should support a REST API and a web frontend that make
+the system accessible for interactive use, dataset management, and result inspection.
+
+2.4 Problem Statement
+
+The central question is: how can a compact local system discover interpretable symbolic
+expressions from numeric examples, store them as a reusable vocabulary, and improve
+its search capability over time — all within the constraints of CPU-only edge hardware?
+
+Three sub-problems follow from this. The first concerns the proposer: how can a small
+neural network provide useful search guidance without the parameter count that typically
+drives quality in generative neural models? The answer pursued here is recursive reuse
+— a two-layer transformer applied iteratively with a persistent carry state, reaching 42
+effective layers from two actual parameter layers.
+
+The second concerns vocabulary growth: how can a growing set of registered functions
+be incorporated into the model's output space without disrupting what the model has
+already learned? The answer is a head expansion mechanism that copies existing weights
+exactly and initializes new rows near the empirical mean of established ones, followed
+by full replay training to consolidate the expanded model.
+
+The third concerns forgetting: how can replay training on all known tasks be structured
+to preserve earlier competence without making each new registration prohibitively
+expensive? The answer is curriculum-ordered replay with early stopping and deep
+supervision, which forces the model to maintain useful predictions across the full
+unrolling trajectory rather than only at convergence.
+
+2.5 Project Plan
+
+The work was organized into five sequential phases. The first phase involved studying the
+TRM architecture from Jolicoeur-Martineau (2025) and identifying how recursive
+reasoning could guide symbolic search rather than serving as a direct answer predictor.
+The second phase mapped out the data flow from raw examples through encoding, search,
+validation, simplification, and registration. The third phase specified the requirements,
+module boundaries, and composition grammar. The fourth phase covered implementation
+of all modules, the server, the frontend, and the noise experiment. The fifth phase
+synthesized results and prepared this report.
+
+2.5.1 Work Breakdown Orientation
+
+The first work package was implementing the TRM and verifying that recursive reasoning
+produces stable gradient flow across repeated block applications. The second was
+implementing the six composition types and the NULL-column elimination scheme. The
+third was building the SQLite registry and the head expansion mechanism. The fourth
+was implementing the replay buffer, the curriculum task generator, and the deep
+supervision training loop. The fifth was building the FastAPI server and SvelteKit
+frontend. The sixth was running the three-part noise column experiment to validate the
+full pipeline under conditions of junk columns, correlated noise, and multi-step synthesis.
+
+2.5.2 Expected Deliverables
+
+The primary deliverable is the working system: backend modules, server, and frontend
+together forming a locally deployable symbolic discovery environment. Secondary
+deliverables include the noise experiment results demonstrating correct symbol recovery
+under junk, correlated, and multi-step synthesis conditions. This report constitutes the
+third deliverable, providing a structured account of the design, implementation, and
+results.

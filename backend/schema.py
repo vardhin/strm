@@ -1,5 +1,5 @@
 """
-Schema definition for the NSSR symbolic function database.
+Schema definition for the NSRR symbolic function database.
 
 Single table design: every function (primitive or learned) lives in `functions`.
 Primitives have layer=0 and composition=NULL.

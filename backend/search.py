@@ -1,5 +1,5 @@
 """
-Program search for NSSR.
+Program search for NSRR.
 
 Strategy: TRM-guided search with NULL-based column elimination.
 The TRM predicts likely function compositions. Junk columns are handled
@@ -37,15 +37,48 @@ def guided(state: dict, model, examples: list[tuple[list[int], Any]],
     return result
 
 
+def guided_with_score(state: dict, model, examples: list[tuple[list[int], Any]],
+                      x_input: torch.Tensor, *, max_steps: int = 10,
+                      max_depth: int = 3,
+                      temperature_boost: float = 0.0) -> tuple[dict | None, float]:
+    """Guided search that also returns a confidence score.
+
+    Score is 1.0 for validated exact matches, otherwise the best near-miss R^2.
+    The returned candidate may be a scored near-miss (with "_score" key) when
+    no exact match was found — the caller can use this for hindsight replay.
+    """
+    return _guided_inner(state, model, examples, x_input,
+                         max_steps=max_steps, max_depth=max_depth,
+                         temperature_boost=temperature_boost)
+
+
+def _get_nucleus_pool(logits: torch.Tensor, p: float,
+                      min_k: int, max_k: int) -> list[int]:
+    """Expand the candidate pool until cumulative probability reaches p."""
+    probs = torch.softmax(logits, dim=-1).flatten()
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    exceeds = (cumulative_probs > p).nonzero(as_tuple=True)[0]
+    if len(exceeds) > 0:
+        k = exceeds[0].item() + 1
+    else:
+        k = len(probs)
+
+    k = max(min_k, min(k, max_k, len(probs)))
+    return sorted_indices[:k].tolist()
+
+
 def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
                   x_input: torch.Tensor, *, max_steps: int = 10,
                   max_depth: int = 3,
                   temperature_boost: float = 0.0) -> tuple[dict | None, float]:
     """Core search loop.
 
-    Returns (candidate, best_near_miss_r2). candidate is None if search failed.
-
-    Uses holdout validation and simplicity preference.
+    Returns (candidate, score). When an exact match is found, candidate is
+    that match and score is 1.0. When no exact match is found, candidate is
+    the best near-miss with a "_score" key set to its R^2 (used by the
+    hindsight feedback loop in learn()).
     """
     model.eval()
 
@@ -73,6 +106,7 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
 
     # Pre-compute NULL column subsets: all ways to drop 0..N-1 columns
     null_subsets = _null_column_subsets(input_arity)
+    valid_perfect_matches: list[dict] = []
 
     for step in range(max_steps):
         carry, outputs = model(carry, x_input)
@@ -84,9 +118,15 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
         }
         comp_logits = outputs["composition_logits"].detach().mean(dim=0) / temperature
 
-        # Top-k predictions (grows with step for diversity, wider on retries)
-        top_k = min(3 + step + int(temperature_boost * 2), n_functions)
-        tops = {k: torch.topk(v, min(top_k, len(v))).indices for k, v in logits.items()}
+        # Dynamic Top-P (nucleus) predictions.
+        # Starts focused and expands as search progresses or retries increase.
+        dynamic_p = min(0.85 + (step * 0.005) + (temperature_boost * 0.05), 0.99)
+        min_k = min(max(1, 3 + (step // 4)), n_functions)
+        tops = {
+            k: torch.tensor(_get_nucleus_pool(v, dynamic_p, min_k, n_functions),
+                            dtype=torch.long)
+            for k, v in logits.items()
+        }
         comp_top = torch.topk(comp_logits, min(len(COMP_TYPES), len(comp_logits))).indices
 
         # Log TRM thought process
@@ -111,29 +151,34 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
             else:
                 near_misses.append(cand)
 
-        # If we found valid candidates, return the simplest one
+        # Collect valid candidates and defer selection until search ends so
+        # we can pick the simplest across all steps, not just the first found.
         if valid_candidates:
-            best = min(valid_candidates, key=_complexity_score)
-            return best, 1.0
+            valid_perfect_matches.extend(valid_candidates)
 
-        # Incremental constant fitting
+        # Incremental constant fitting (best, not first)
         step_misses = near_misses[-new_count:] if new_count > 0 else []
-        fitted = _try_fit_any(state, step_misses[:50], train_examples)
+        fitted = _try_fit_best(state, step_misses, train_examples)
         if fitted is not None and exe.validate(state, fitted, holdout_examples):
-            return fitted, 1.0
+            valid_perfect_matches.append(fitted)
 
         # Small noise on carry for exploration
         with torch.no_grad():
             carry.y = carry.y + torch.randn_like(carry.y) * 0.01
             carry.z = carry.z + torch.randn_like(carry.z) * 0.01
 
-    # Final pass: constant fitting on near misses
-    fitted = _try_fit_any(state, near_misses[:200], train_examples)
-    if fitted is not None and exe.validate(state, fitted, holdout_examples):
-        return fitted, 1.0
+    # Final pass: constant fitting on all near misses
+    final_fitted = _try_fit_best(state, near_misses, train_examples)
+    if final_fitted is not None and exe.validate(state, final_fitted, holdout_examples):
+        valid_perfect_matches.append(final_fitted)
 
-    # Score best near miss
+    if valid_perfect_matches:
+        best_overall = min(valid_perfect_matches, key=_complexity_score)
+        return best_overall, 1.0
+
+    # Score best near miss and pass it up for hindsight replay.
     best_r2 = -1.0
+    best_miss = None
     if near_misses:
         _log_near_misses(state, near_misses, examples)
         for cand in near_misses:
@@ -146,7 +191,15 @@ def _guided_inner(state: dict, model, examples: list[tuple[list[int], Any]],
                 except Exception:
                     break
             if len(produced) == len(examples):
-                best_r2 = max(best_r2, _r2(expected, produced))
+                r2 = _r2(expected, produced)
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_miss = cand
+
+    if best_miss is not None:
+        scored_miss = dict(best_miss)
+        scored_miss["_score"] = best_r2
+        return scored_miss, best_r2
 
     return None, best_r2
 
@@ -538,12 +591,28 @@ def _try_fit_constants(state: dict, cand: dict,
 
 def _try_fit_any(state: dict, candidates: list[dict],
                   examples: list[tuple[list, Any]]) -> dict | None:
-    """Try constant-fitting on a list of candidates."""
+    """Try constant-fitting on a list of candidates. Return first match."""
     for cand in candidates:
         fitted = _try_fit_constants(state, cand, examples)
         if fitted is not None:
             return fitted
     return None
+
+
+def _try_fit_best(state: dict, candidates: list[dict],
+                  examples: list[tuple[list, Any]]) -> dict | None:
+    """Try constant-fitting and return the mathematically simplest match."""
+    valid_fits = []
+    for cand in candidates:
+        fitted = _try_fit_constants(state, cand, examples)
+        if fitted is not None:
+            valid_fits.append(fitted)
+
+    if not valid_fits:
+        return None
+
+    # Occam's Razor: sort by complexity score and return the simplest.
+    return min(valid_fits, key=_complexity_score)
 
 
 def _fit_scale(produced: list[float], expected: list[float]) -> float | None:
