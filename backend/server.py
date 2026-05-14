@@ -1,5 +1,5 @@
 """
-NSSR Experiment Server.
+NSRR Experiment Server.
 
 FastAPI server for running reproducible experiments without touching
 the core pipeline code. Provides endpoints for:
@@ -40,7 +40,8 @@ import search
 import train
 import simplify
 from model import TRM, create_model, fresh_carry, resize_heads
-from main import build_composition, CONFIG, learn, curriculum_tasks, _init_replay_buffer
+from main import (build_composition, CONFIG, learn, curriculum_tasks,
+                  _init_replay_buffer, pretrain_curriculum)
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +217,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="NSSR Experiment Server",
+    title="NSRR Experiment Server",
     description="Reproducible experimentation for Neuro-Symbolic Recursive Regression",
     lifespan=lifespan,
 )
@@ -572,18 +573,11 @@ def run_experiment(req: ExperimentRequest):
     env = _get_or_create_env(req.model_name)
     results = []
 
-    # Phase 1: curriculum pre-training via replay buffer
-    # The replay buffer is initialized with curriculum tasks and replayed
-    # fully on every learn() call, so we just ensure it's set up here.
+    # Phase 1: curriculum pre-training (per-task train_on_examples — matches master.main())
     if req.pre_train:
-        _init_replay_buffer(env["state"])
+        pretrain_curriculum(env["model"], env["optimizer"], env["state"],
+                            num_epochs=req.pre_train_epochs)
         n_tasks = len(env["state"]["replay_buffer"])
-        # Do an initial replay pass so the model learns the curriculum
-        train.train_on_replay(
-            env["model"], env["optimizer"], env["state"]["replay_buffer"],
-            input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
-            epochs_per_task=15, n_sup=CONFIG["n_sup"],
-        )
         results.append({"phase": "pre_training", "tasks": n_tasks, "status": "done"})
 
     # Phase 2: progressive learning from datasets

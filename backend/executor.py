@@ -1,5 +1,5 @@
 """
-Program executor for NSSR.
+Program executor for NSRR.
 
 Runs composed programs described by a candidate dict against inputs.
 Validates candidates against input/output examples.

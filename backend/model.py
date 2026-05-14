@@ -1,5 +1,5 @@
 """
-TRM (Tiny Recursive reasoning Model) for NSSR.
+TRM (Tiny Recursive reasoning Model) for NSRR.
 
 Based on "Less is More: Recursive Reasoning with Tiny Networks"
 (Jolicoeur-Martineau, 2025).

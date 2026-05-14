@@ -13,7 +13,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
-	<title>NSSR</title>
+	<title>NSRR</title>
 </svelte:head>
 
 <div class="app">

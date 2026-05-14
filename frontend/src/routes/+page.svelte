@@ -20,7 +20,7 @@
 	onMount(load);
 </script>
 
-<h1>NSSR Dashboard</h1>
+<h1>NSRR Dashboard</h1>
 <p class="muted">
 	Neuro-Symbolic Recursive Regression — discover equations from data using a tiny recursive
 	reasoning model and a symbolic function registry.

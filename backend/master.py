@@ -14,7 +14,7 @@ import registry as reg
 import db
 
 """
-TRM (Tiny Recursive reasoning Model) for NSSR.
+TRM (Tiny Recursive reasoning Model) for NSRR.
 
 Based on "Less is More: Recursive Reasoning with Tiny Networks"
 (Jolicoeur-Martineau, 2025).
@@ -259,7 +259,7 @@ def resize_heads(model: TRM, old_n: int, new_n: int) -> None:
 
 
 """
-Composition simplifier for NSSR.
+Composition simplifier for NSRR.
 
 After search finds a working composition, try to make it shorter
 before registering it as a new function.
@@ -472,7 +472,7 @@ def _complexity(state: dict, composition: list[tuple[int, list[int]]]) -> int:
 
 
 """
-Program search for NSSR.
+Program search for NSRR.
 
 Strategy: TRM-guided search with NULL-based column elimination.
 The TRM predicts likely function compositions. Junk columns are handled
@@ -1190,7 +1190,7 @@ def format_examples(examples: list[tuple[list, Any]], *,
     return data
 
 """
-Training for the NSSR TRM model.
+Training for the NSRR TRM model.
 
 Uses deep supervision: each training step runs N_sup supervision steps,
 where the carry (y, z) is detached between steps. This lets the model
@@ -1770,7 +1770,7 @@ def _fmt_candidate(state: dict, c: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    print("NSSR — Neuro-Symbolic Recursive Regression\n")
+    print("NSRR — Neuro-Symbolic Recursive Regression\n")
 
     conn = db.init_db(os.path.join(CONFIG["checkpoint_dir"], "symbolic.db"))
     state = reg.init_registry(conn)

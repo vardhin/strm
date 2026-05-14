@@ -1,5 +1,5 @@
 """
-NSSR — Neuro-Symbolic Recursive Regression
+NSRR — Neuro-Symbolic Recursive Regression
 
 Single entry point. Runs the full learning pipeline:
   1. Initialize registry with primitives
@@ -120,6 +120,22 @@ def _init_replay_buffer(state: dict):
         print(f"  replay buffer initialized with {len(state['replay_buffer'])} curriculum tasks")
 
 
+def pretrain_curriculum(model: TRM, optimizer: torch.optim.Optimizer,
+                        state: dict, *, num_epochs: int = 20) -> None:
+    """Heavy curriculum pre-training: per-task train_on_examples with deep supervision.
+
+    Mirrors master.main()'s pre-training loop. Use this on a fresh model
+    before any progressive learning so the TRM knows the primitive tasks
+    and composition types before search runs.
+    """
+    print("  loading curriculum knowledge (heavy pre-train)...")
+    _init_replay_buffer(state)
+    for task in state["replay_buffer"]:
+        train.train_on_examples(model, optimizer, task["examples"], task["target"],
+                                input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
+                                num_epochs=num_epochs, n_sup=CONFIG["n_sup"])
+
+
 def _is_duplicate_discovery(state: dict, candidate: dict) -> bool:
     """Check if this candidate is structurally identical to an existing discovery.
 
@@ -145,7 +161,11 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
           num_epochs: int = 30, max_retries: int = 2) -> tuple[bool, torch.optim.Optimizer, float]:
     """Full pipeline: search -> simplify -> register -> replay train.
 
-    If search fails, re-trains on accumulated knowledge and retries.
+    Uses guided_with_score and a hindsight feedback loop: if search produces
+    a strong near-miss (0.90 < R^2 < 0.999), train the TRM briefly on the
+    near-miss target then retry. Only candidates with score >= 0.999 are
+    registered.
+
     Returns (success, optimizer, r2_score).
     """
     input_dim = CONFIG["input_dim"]
@@ -155,29 +175,46 @@ def learn(conn: sqlite3.Connection, state: dict, model: TRM,
     fresh = "replay_buffer" not in state
     _init_replay_buffer(state)
     if fresh:
-        print("  loading curriculum knowledge...")
-        train.train_on_replay(model, optimizer, state["replay_buffer"],
-                              input_dim=input_dim, seq_len=seq_len,
-                              epochs_per_task=2, n_sup=CONFIG["n_sup"])
+        pretrain_curriculum(model, optimizer, state)
 
     print(f"\n{'=' * 50}")
     print(f"Learning: {name}")
     print(f"{'=' * 50}")
 
-    # Search with retries: if search fails, re-train on what we know and try again
     x_input = search.format_examples(examples, input_dim=input_dim, seq_len=seq_len)
-    candidate = None
-    for attempt in range(1 + max_retries):
-        candidate = search.guided(state, model, examples, x_input,
-                                  max_steps=max_search_steps, max_depth=max_depth,
-                                  temperature_boost=attempt * 1.0)
-        if candidate is not None:
-            break
-        if attempt < max_retries:
-            print(f"  search failed (attempt {attempt + 1}), retrying with higher temperature...")
+    candidate, score = search.guided_with_score(
+        state, model, examples, x_input,
+        max_steps=max_search_steps, max_depth=max_depth)
 
-    if candidate is None:
-        print(f"  could not find composition for {name}")
+    # Hindsight feedback loop: learn from strong near-misses, then retry.
+    if candidate is not None and 0.90 < score < 0.999:
+        print(f"  [RL Feedback] Search found a strong near-miss (R^2={score:.4f}).")
+        print("  [RL Feedback] Updating TRM priors from this near-miss...")
+
+        fake_target = dict(candidate)
+        fake_target.pop("_score", None)
+        fake_task = {"target": fake_target, "examples": examples}
+        state["replay_buffer"].append(fake_task)
+
+        model.train()
+        for _ in range(5):
+            train.train_on_examples(
+                model, optimizer, examples, fake_target,
+                input_dim=input_dim, seq_len=seq_len,
+                num_epochs=1, n_sup=max(4, CONFIG["n_sup"] // 2),
+            )
+        state["replay_buffer"].pop()
+
+        print("  [RL Feedback] Priors updated. Retrying guided search...")
+        model.eval()
+        candidate, score = search.guided_with_score(
+            state, model, examples, x_input,
+            max_steps=max_search_steps, max_depth=max_depth,
+            temperature_boost=0.5,
+        )
+
+    if candidate is None or score < 0.999:
+        print(f"  could not find exact composition for {name}")
         return False, optimizer, 0.0
 
     constants = candidate.get("constants")
@@ -539,7 +576,7 @@ def _fmt_candidate(state: dict, c: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    print("NSSR — Neuro-Symbolic Recursive Regression\n")
+    print("NSRR — Neuro-Symbolic Recursive Regression\n")
 
     # Database + registry
     conn = db.init_db(os.path.join(CONFIG["checkpoint_dir"], "symbolic.db"))
@@ -559,10 +596,7 @@ def main():
 
     # Phase 1: curriculum pre-training
     print("\n--- Curriculum pre-training ---")
-    for task in curriculum_tasks(state):
-        train.train_on_examples(model, optimizer, task["examples"], task["target"],
-                                input_dim=CONFIG["input_dim"], seq_len=CONFIG["seq_len"],
-                                num_epochs=20, n_sup=CONFIG["n_sup"])
+    pretrain_curriculum(model, optimizer, state, num_epochs=20)
 
     # Phase 2: progressive learning
     print("\n--- Progressive learning ---")

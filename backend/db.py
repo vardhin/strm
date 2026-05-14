@@ -1,5 +1,5 @@
 """
-Database operations for the NSSR symbolic function registry.
+Database operations for the NSRR symbolic function registry.
 
 All functions take a sqlite3.Connection as their first argument.
 Call `init_db` once to get a connection with the schema applied.
@@ -19,7 +19,7 @@ from schema import ALL_TABLES, ALL_INDEXES
 def init_db(db_path: str = "checkpoints/symbolic.db") -> sqlite3.Connection:
     """Create (or open) the database and ensure schema exists."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     for table in ALL_TABLES:
         conn.execute(table)
